@@ -21,25 +21,25 @@
 <p>Baseline: <code>logs/mock.csv</code> &nbsp;|&nbsp; AI-driven: <code>logs/mock-ai.csv</code></p>
 
 <div class="stats">
-  <div class="stat"><div class="value savings">1.2%</div><div class="label">Cost reduction</div></div>
-  <div class="stat"><div class="value savings">-1.53%</div><div class="label">CO2 reduction</div></div>
-  <div class="stat"><div class="value savings">27.0%</div><div class="label">Peak-hour energy cut</div></div>
+  <div class="stat"><div class="value savings">3.98%</div><div class="label">Cost reduction</div></div>
+  <div class="stat"><div class="value savings">2.09%</div><div class="label">CO2 reduction</div></div>
+  <div class="stat"><div class="value savings">23.33%</div><div class="label">Peak-hour energy cut</div></div>
   <div class="stat"><div class="value savings">0</div><div class="label">Comfort violations</div></div>
 </div>
 
-<p class="note">Total energy is roughly unchanged (57.377 &rarr; 60.373 kWh,
--5.22%). That is expected and is the point: the agent shifts <em>when</em>
+<p class="note">Total energy is roughly unchanged (57.377 &rarr; 58.17 kWh,
+-1.38%). That is expected and is the point: the agent shifts <em>when</em>
 energy is drawn rather than reducing how much, heating while power is cheap and
 clean and coasting on stored heat through the expensive carbon-heavy peak. A fixed
 setback schedule cannot do this &mdash; it has no notion of what hour it is in price
 terms.</p>
 
 <div class="stats">
-  <div class="stat"><div class="value">8.18 &rarr; 8.08</div><div class="label">Cost (baseline &rarr; AI)</div></div>
-  <div class="stat"><div class="value">15.49 &rarr; 15.73</div><div class="label">kg CO2</div></div>
-  <div class="stat"><div class="value">7.57 &rarr; 5.52</div><div class="label">Peak-window kWh</div></div>
-  <div class="stat"><div class="value">1.786s</div><div class="label">Avg agent latency</div></div>
-  <div class="stat"><div class="value">60.4%</div><div class="label">Supervisor overrides</div></div>
+  <div class="stat"><div class="value">8.18 &rarr; 7.86</div><div class="label">Cost (baseline &rarr; AI)</div></div>
+  <div class="stat"><div class="value">15.49 &rarr; 15.17</div><div class="label">kg CO2</div></div>
+  <div class="stat"><div class="value">7.57 &rarr; 5.8</div><div class="label">Peak-window kWh</div></div>
+  <div class="stat"><div class="value">1.592s</div><div class="label">Avg agent latency</div></div>
+  <div class="stat"><div class="value">95.8%</div><div class="label">Supervisor overrides</div></div>
 </div>
 
 <p class="note">The supervisor override rate is the share of LLM setpoint decisions

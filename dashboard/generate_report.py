@@ -140,19 +140,34 @@ def make_charts(baseline: pd.DataFrame, ai: pd.DataFrame, out_dir: str) -> dict:
     # per step against the price curve. The visible signature is the AI
     # trace rising before the shaded peak and dropping inside it.
     if "cost_step" in ai.columns:
-        day = ai[ai["step"] < 96] if (ai["step"] < 96).any() else ai
-        base_day = baseline[baseline["step"] < 96] if (baseline["step"] < 96).any() else baseline
-        hours = day["minute_of_day"] / 60.0
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(base_day["minute_of_day"] / 60.0, base_day["energy_kwh_step"],
-                label="Baseline", color="tab:blue")
-        ax.plot(hours, day["energy_kwh_step"], label="AI-driven", color="tab:orange")
-        ax.axvspan(grid.PEAK_START_HOUR, grid.PEAK_END_HOUR, color="red", alpha=0.12,
-                   label="On-peak price window")
+        # Hourly totals, not per-step values. Per-step energy is spiky
+        # (every setpoint change shows as a transient) and dominated by
+        # standing heat loss, which buries the actual difference. Hourly
+        # bars are what the claim is about: how much energy lands inside
+        # the expensive window.
+        #
+        # Grouping by hour also sidesteps a plotting artifact: minute_of_day
+        # wraps from 1425 back to 0 at the end of each day, so a line plot
+        # drew a spurious horizontal streak from hour 23.75 back to hour 0.
+        def hourly(df):
+            h = (df["minute_of_day"] // 60).astype(int)
+            days = max(1, df["day"].nunique())
+            return df.groupby(h)["energy_kwh_step"].sum().reindex(range(24), fill_value=0) / days
+
+        base_h, ai_h = hourly(baseline), hourly(ai)
+        fig, ax = plt.subplots(figsize=(9, 4))
+        width = 0.42
+        ax.bar([h - width / 2 for h in range(24)], base_h, width,
+               label="Baseline", color="tab:blue")
+        ax.bar([h + width / 2 for h in range(24)], ai_h, width,
+               label="AI-driven", color="tab:orange")
+        ax.axvspan(grid.PEAK_START_HOUR - 0.5, grid.PEAK_END_HOUR - 0.5,
+                   color="red", alpha=0.12, label="Expensive hours (peak price + carbon)")
         ax.set_xlabel("Hour of day")
-        ax.set_ylabel("Energy per step (kWh)")
-        ax.set_title("Load shifting: energy drawn vs price peak")
-        ax.set_xlim(0, 24)
+        ax.set_ylabel("Energy used that hour (kWh, daily average)")
+        ax.set_title("Load shifting: the agent buys energy before the peak, not during it")
+        ax.set_xticks(range(0, 24, 2))
+        ax.set_xlim(-1, 24)
         ax.legend()
         fig.tight_layout()
         shift_path = os.path.join(out_dir, "load_shift.png")

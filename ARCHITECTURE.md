@@ -102,7 +102,10 @@ phrasing but **lower cognitive load**.
 | Explicit numeric setback ("hold 18.0 °C when empty") | Held steady, but energy 13.9% worse than baseline |
 | Four-branch conditional with preheat | 40/40 occupied steps in comfort violation |
 | Flat `condition → exact number` rule table | Model emitted `18.915` — a value from no rule |
-| Same table, plus greedy decoding | Usable; 12.5% override rate |
+| Same table, plus greedy decoding | Usable; 12.5% override rate (3 rules) |
+| Five rules, after adding grid-awareness | 60.4% override rate |
+| Cut back to three rules, three output values | 95.8% override rate; 44/48 cycles produced no setpoint |
+| State injected into the prompt instead of fetched | Always answered, but 1/6 correct — reverted |
 
 **Findings that generalise:**
 
@@ -119,10 +122,34 @@ phrasing but **lower cognitive load**.
   outcomes, making every A/B comparison meaningless. Fixed with
   `temperature: 0.0` and `seed: 42`.
 
-**The honest limit.** In a direct test — zone occupied, PMV −2.3, prompt
-rule reading `occupied is true -> setpoint 22.0` — the model returned
-`set_zone_setpoint(18.0)`. No phrasing fixes that. This is why the
-supervisor exists (§5).
+**The honest limit — a capability probe, not a phrasing problem.**
+To establish whether any prompt could work, the task was stripped to the
+simplest form it can take: two pre-computed booleans, a three-line lookup
+table, no arithmetic, no thresholds, no multi-step tool flow.
+
+```
+building_empty_for_a_while is true   -> 18.0
+price_peak_coming_soon is true       -> 23.5
+otherwise                            -> 20.5
+```
+
+The model scored 3/6 — and the three it got right were exactly the three
+whose answer was the `otherwise` line. It failed every case where a flag
+was true. It is not reading the input; it emits a constant.
+
+There is nothing below this to simplify. Anything further means writing
+the answer into the prompt, at which point the model is not controlling
+anything. Two related failures point the same way:
+
+- **Numeric thresholds fail.** "more than 120", "between 1 and 120" —
+  every miss in the three-rule version was a range comparison.
+- **It copies numbers out of its input.** It answered `21.0` (the current
+  setpoint, permitted by no rule) and earlier `18.915` (the current zone
+  temperature). `setpoint_c` was removed from the state passed to it for
+  this reason.
+
+This is why the supervisor exists (§5), and why the model is the binding
+constraint on this project rather than the prompt.
 
 ---
 

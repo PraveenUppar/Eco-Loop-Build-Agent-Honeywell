@@ -318,6 +318,23 @@ class ToolExecutor:
             return self.set_zone_setpoint(**arguments)
         raise ValueError(f"Unknown tool: {name}")
 
-    def consume_pending_setpoint(self) -> float:
-        """Called once per loop step after the agent has finished reasoning."""
+    def begin_cycle(self) -> None:
+        """
+        Clear the pending setpoint before the agent starts reasoning.
+
+        Without this, a cycle in which the model never successfully called
+        `set_zone_setpoint` silently reused the previous value and reported
+        it as the agent's proposal - so non-decisions were logged as
+        decisions. It made the agent look like it was choosing 21.0 (the
+        initial default) fifteen times when it had in fact chosen nothing.
+        """
+        self._pending_setpoint = None
+
+    def consume_pending_setpoint(self) -> float | None:
+        """
+        The setpoint the agent asked for this cycle, or None if it never
+        made a valid call. None is meaningful - `supervisor.supervise()`
+        treats it as "agent produced no setpoint" and applies a
+        situation-appropriate fallback instead of a stale number.
+        """
         return self._pending_setpoint
