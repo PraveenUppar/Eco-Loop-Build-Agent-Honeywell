@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Eco-Loop Savings Dashboard</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, sans-serif; margin: 2rem; background: #0e1117; color: #e6e6e6; }
+  h1 { font-size: 1.4rem; }
+  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 1.5rem 0; }
+  .stat { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem 1.5rem; min-width: 160px; }
+  .stat .value { font-size: 1.6rem; font-weight: 600; }
+  .stat .label { font-size: 0.8rem; color: #9198a1; text-transform: uppercase; letter-spacing: 0.04em; }
+  .savings { color: #3fb950; }
+  .warn { color: #f85149; }
+  img { max-width: 100%; border-radius: 8px; margin: 1rem 0; border: 1px solid #30363d; }
+</style>
+</head>
+<body>
+<h1>Eco-Loop Building Agent &mdash; Savings Dashboard</h1>
+<p>Baseline: <code>logs/mock.csv</code> &nbsp;|&nbsp; AI-driven: <code>logs/mock.csv</code></p>
+
+<div class="stats">
+  <div class="stat"><div class="value">12.597 kWh</div><div class="label">Baseline energy</div></div>
+  <div class="stat"><div class="value">12.597 kWh</div><div class="label">AI-driven energy</div></div>
+  <div class="stat"><div class="value savings">0.0%</div><div class="label">Energy reduction</div></div>
+  <div class="stat"><div class="value warn">11</div><div class="label">AI comfort violations</div></div>
+  <div class="stat"><div class="value">0.0s</div><div class="label">Avg agent latency/step</div></div>
+</div>
+
+<h2>Cumulative energy</h2>
+<img src="energy_comparison.png" alt="Cumulative energy comparison">
+
+<h2>Comfort band adherence (AI-driven run)</h2>
+<img src="comfort_band.png" alt="Comfort band chart">
+
+</body>
+</html>
