@@ -26,7 +26,9 @@ from tools import MockBuilding, ToolExecutor
 
 LOG_COLUMNS = [
     "step", "day", "minute_of_day", "zone_temp_c", "outdoor_temp_c",
-    "setpoint_c", "occupied", "pmv", "energy_kwh_step", "latency_s", "reasoning",
+    "setpoint_c", "occupied", "pmv", "energy_kwh_step", "cost_step",
+    "carbon_g_step", "latency_s",
+    "agent_ran", "agent_proposed_c", "overridden", "override_reason", "reasoning",
 ]
 
 
@@ -38,7 +40,7 @@ def rule_based_setpoint(occupied: bool) -> float:
 def open_log(mode: str):
     os.makedirs("logs", exist_ok=True)
     path = os.path.join("logs", f"{mode}.csv")
-    f = open(path, "w", newline="")
+    f = open(path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=LOG_COLUMNS)
     writer.writeheader()
     return f, writer, path
@@ -57,7 +59,8 @@ def run_mock(hours: int, step_minutes: int) -> str:
                 "step": i, "day": s.day, "minute_of_day": s.minute_of_day,
                 "zone_temp_c": s.zone_temp_c, "outdoor_temp_c": s.outdoor_temp_c,
                 "setpoint_c": s.setpoint_c, "occupied": s.occupied, "pmv": s.pmv,
-                "energy_kwh_step": s.energy_kwh_step, "latency_s": 0.0, "reasoning": "",
+                "energy_kwh_step": s.energy_kwh_step, "cost_step": s.cost_step,
+                "carbon_g_step": s.carbon_g_step, "latency_s": 0.0, "reasoning": "",
             })
     finally:
         f.close()
@@ -65,39 +68,100 @@ def run_mock(hours: int, step_minutes: int) -> str:
     return path
 
 
-def run_mock_ai(hours: int, step_minutes: int, model: str, agent_every_n_steps: int) -> str:
+def run_mock_rules(hours: int, step_minutes: int) -> str:
+    """
+    Supervisor rules alone, no LLM in the loop.
+
+    This is the experimental control arm: it answers "how much does the
+    language model actually add over the deterministic rules it's paired
+    with?" Comparing mock-ai against this - rather than only against the
+    fixed-schedule baseline - is what keeps the LLM's contribution
+    honest, since `supervise(None, ...)` takes exactly the same rule
+    branches the supervisor would use to override the agent.
+    """
+    from supervisor import supervise
+
+    building = MockBuilding(step_minutes=step_minutes)
+    executor = ToolExecutor(building)
+    steps = int(hours * 60 / step_minutes)
+
+    f, writer, path = open_log("mock-rules")
+    try:
+        for i in range(steps):
+            setpoint = supervise(None, executor.get_zone_state()).setpoint_c
+            s = building.step(setpoint)
+            writer.writerow({
+                "step": i, "day": s.day, "minute_of_day": s.minute_of_day,
+                "zone_temp_c": s.zone_temp_c, "outdoor_temp_c": s.outdoor_temp_c,
+                "setpoint_c": s.setpoint_c, "occupied": s.occupied, "pmv": s.pmv,
+                "energy_kwh_step": s.energy_kwh_step, "cost_step": s.cost_step,
+                "carbon_g_step": s.carbon_g_step, "latency_s": 0.0,
+                "agent_ran": False, "agent_proposed_c": "", "overridden": False,
+                "override_reason": "", "reasoning": "",
+            })
+    finally:
+        f.close()
+    print(f"[mock-rules] {steps} steps logged to {path}")
+    return path
+
+
+def run_mock_ai(hours: int, step_minutes: int, model: str, agent_every_n_steps: int,
+                use_supervisor: bool = True) -> str:
     from llm_agent import HVACAgent  # deferred import: needs ollama installed
+    from supervisor import OverrideStats, supervise
 
     building = MockBuilding(step_minutes=step_minutes)
     executor = ToolExecutor(building)
     agent = HVACAgent(executor, model=model)
     steps = int(hours * 60 / step_minutes)
+    stats = OverrideStats()
 
     f, writer, path = open_log("mock-ai")
     current_setpoint = building.state.setpoint_c
     reasoning = ""
     latency = 0.0
+    overridden = False
+    override_reason = ""
+    agent_proposed = current_setpoint
     try:
         for i in range(steps):
-            if i % agent_every_n_steps == 0:
+            agent_ran = i % agent_every_n_steps == 0
+            if agent_ran:
                 result = agent.run_step()
-                current_setpoint = result.final_setpoint_c
+                agent_proposed = result.final_setpoint_c
                 reasoning = result.reasoning
                 latency = result.latency_s
-                print(f"  step {i}: setpoint -> {current_setpoint}C "
-                      f"({latency}s) | {reasoning[:80]}")
+
+                if use_supervisor:
+                    decision = supervise(agent_proposed, executor.get_zone_state())
+                    stats.record(decision)
+                    current_setpoint = decision.setpoint_c
+                    overridden = decision.overridden
+                    override_reason = decision.reason
+                else:
+                    current_setpoint = agent_proposed
+                    overridden, override_reason = False, ""
+
+                flag = f" [OVERRIDE: {override_reason}]" if overridden else ""
+                print(f"  step {i}: agent {agent_proposed}C -> applied "
+                      f"{current_setpoint}C ({latency}s){flag}")
 
             s = building.step(current_setpoint)
             writer.writerow({
                 "step": i, "day": s.day, "minute_of_day": s.minute_of_day,
                 "zone_temp_c": s.zone_temp_c, "outdoor_temp_c": s.outdoor_temp_c,
                 "setpoint_c": s.setpoint_c, "occupied": s.occupied, "pmv": s.pmv,
-                "energy_kwh_step": s.energy_kwh_step, "latency_s": latency,
+                "energy_kwh_step": s.energy_kwh_step, "cost_step": s.cost_step,
+                "carbon_g_step": s.carbon_g_step, "latency_s": latency,
+                "agent_ran": agent_ran, "agent_proposed_c": agent_proposed,
+                "overridden": overridden, "override_reason": override_reason,
                 "reasoning": reasoning,
             })
     finally:
         f.close()
     print(f"[mock-ai] {steps} steps logged to {path}")
+    if use_supervisor:
+        print(f"[mock-ai] supervisor: {stats.summary()}")
     return path
 
 
@@ -170,22 +234,30 @@ def main():
     parser = argparse.ArgumentParser(description="Eco-Loop closed-loop control runner")
     parser.add_argument(
         "--mode", required=True,
-        choices=["mock", "mock-ai", "baseline", "ai"],
-        help="mock/mock-ai use the lightweight simulator; baseline/ai use real EnergyPlus",
+        choices=["mock", "mock-rules", "mock-ai", "baseline", "ai"],
+        help="mock/mock-rules/mock-ai use the lightweight simulator "
+             "(mock-rules = supervisor rules with no LLM, the control arm); "
+             "baseline/ai use real EnergyPlus",
     )
     parser.add_argument("--hours", type=float, default=24.0, help="mock horizon in hours")
     parser.add_argument("--step-minutes", type=int, default=15, help="mock step size")
     parser.add_argument("--agent-every-n-steps", type=int, default=1,
                          help="call the LLM every N steps in mock-ai mode (reduces latency cost)")
     parser.add_argument("--model", default="qwen2.5-coder:1.5b", help="Ollama model name")
+    parser.add_argument("--no-supervisor", action="store_true",
+                         help="apply the agent's raw setpoints without the deterministic "
+                              "override layer - use this to measure unassisted agent quality")
     parser.add_argument("--idf", help="path to .idf (required for baseline/ai)")
     parser.add_argument("--epw", help="path to .epw weather file (required for baseline/ai)")
     args = parser.parse_args()
 
     if args.mode == "mock":
         run_mock(args.hours, args.step_minutes)
+    elif args.mode == "mock-rules":
+        run_mock_rules(args.hours, args.step_minutes)
     elif args.mode == "mock-ai":
-        run_mock_ai(args.hours, args.step_minutes, args.model, args.agent_every_n_steps)
+        run_mock_ai(args.hours, args.step_minutes, args.model, args.agent_every_n_steps,
+                    use_supervisor=not args.no_supervisor)
     else:
         if not args.idf or not args.epw:
             parser.error("--idf and --epw are required for baseline/ai modes")

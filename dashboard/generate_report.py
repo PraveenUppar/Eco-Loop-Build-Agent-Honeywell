@@ -43,6 +43,22 @@ def summarize(baseline: pd.DataFrame, ai: pd.DataFrame) -> dict:
     ai_kwh = ai["energy_kwh_step"].sum()
     savings_pct = 0.0 if baseline_kwh == 0 else (baseline_kwh - ai_kwh) / baseline_kwh * 100
 
+    # Share of agent decisions the deterministic supervisor had to correct.
+    # Reported prominently and deliberately: a high rate means the headline
+    # savings reflect the override rules more than the LLM's own judgment,
+    # and hiding that would misrepresent what the agent achieved.
+    if {"overridden", "agent_ran"} <= set(ai.columns):
+        # Count one decision per agent invocation, not per simulation step -
+        # the agent runs every N steps and its decision is held in between.
+        # (Selecting on "setpoint changed" would badly overstate this, since
+        # an override is exactly what usually changes the setpoint.)
+        ran = ai["agent_ran"].astype(str).str.lower().isin(["true", "1"])
+        decisions = ai[ran]
+        flags = decisions["overridden"].astype(str).str.lower().isin(["true", "1"])
+        override_pct = round(flags.mean() * 100, 1) if len(decisions) else 0.0
+    else:
+        override_pct = None
+
     return {
         "baseline_kwh": round(baseline_kwh, 3),
         "ai_kwh": round(ai_kwh, 3),
@@ -51,6 +67,7 @@ def summarize(baseline: pd.DataFrame, ai: pd.DataFrame) -> dict:
         "ai_comfort_violations": comfort_violations(ai),
         "baseline_avg_latency_s": round(baseline["latency_s"].mean(), 3),
         "ai_avg_latency_s": round(ai["latency_s"].mean(), 3),
+        "supervisor_override_pct": override_pct,
     }
 
 
@@ -103,6 +120,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .stat .label {{ font-size: 0.8rem; color: #9198a1; text-transform: uppercase; letter-spacing: 0.04em; }}
   .savings {{ color: #3fb950; }}
   .warn {{ color: #f85149; }}
+  .note {{ font-size: 0.85rem; color: #9198a1; max-width: 60ch; line-height: 1.5; }}
   img {{ max-width: 100%; border-radius: 8px; margin: 1rem 0; border: 1px solid #30363d; }}
 </style>
 </head>
@@ -116,7 +134,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="stat"><div class="value savings">{savings_pct}%</div><div class="label">Energy reduction</div></div>
   <div class="stat"><div class="value {comfort_class}">{ai_comfort_violations}</div><div class="label">AI comfort violations</div></div>
   <div class="stat"><div class="value">{ai_avg_latency_s}s</div><div class="label">Avg agent latency/step</div></div>
+  <div class="stat"><div class="value">{supervisor_override_pct}%</div><div class="label">Supervisor overrides</div></div>
 </div>
+
+<p class="note">The supervisor override rate is the share of LLM setpoint decisions
+that the deterministic safety layer had to correct (see <code>supervisor.py</code>).
+The higher this number, the more the results above reflect the override rules
+rather than the language model's own control judgment.</p>
 
 <h2>Cumulative energy</h2>
 <img src="{energy_chart}" alt="Cumulative energy comparison">

@@ -24,6 +24,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+import grid
+
 # Hard safety limits - the LLM can never move the setpoint outside this
 # range, regardless of what it asks for. This is what Hour 3-7's
 # "confirm the comfort clamp actually rejects out-of-band requests" step
@@ -45,6 +47,8 @@ class ZoneState:
     setpoint_c: float = 21.0
     occupied: bool = False
     energy_kwh_step: float = 0.0
+    cost_step: float = 0.0
+    carbon_g_step: float = 0.0
     pmv: float = 0.0
     minute_of_day: int = 0
     day: int = 0
@@ -63,23 +67,55 @@ class MockBuilding:
     """
 
     def __init__(self, step_minutes: int = 15, envelope_loss: float = 0.08,
-                 hvac_gain: float = 0.4, thermal_mass: float = 0.5):
+                 hvac_gain: float = 0.4, thermal_mass: float = 0.5,
+                 hvac_capacity: float = 3.0,
+                 outdoor_base_c: float = 4.0, outdoor_swing_c: float = 5.0):
         self.step_minutes = step_minutes
+        # Winter-ish default (-1C to 9C over the day). The earlier mild
+        # profile (6C to 22C) put outdoor temperature ABOVE the indoor
+        # target every afternoon, so the heating was already off during
+        # the evening price peak - which left load shifting nothing to
+        # shift and made the whole grid-signal question moot.
+        self.outdoor_base_c = outdoor_base_c
+        self.outdoor_swing_c = outdoor_swing_c
         self.envelope_loss = envelope_loss  # how fast zone tracks outdoor temp
-        self.hvac_gain = hvac_gain          # how fast zone tracks setpoint
+        self.hvac_gain = hvac_gain          # how fast zone closes the setpoint gap
         self.thermal_mass = thermal_mass    # inertia (0-1, higher = slower to change)
+        self.hvac_capacity = hvac_capacity  # max heat per step (limits warm-up rate)
         self.state = ZoneState()
 
     def _outdoor_temp(self, day: int, minute_of_day: int) -> float:
         """Simple diurnal sine wave: cool at 4am, peak mid-afternoon."""
         hour = minute_of_day / 60.0
-        base = 14.0 + 2.0 * day * 0.0  # flat across days for now, easy to extend
-        swing = 8.0 * math.sin(math.pi * (hour - 9) / 12)
-        return round(base + swing, 2)
+        swing = self.outdoor_swing_c * math.sin(math.pi * (hour - 9) / 12)
+        return round(self.outdoor_base_c + swing, 2)
 
     def _occupied(self, minute_of_day: int) -> bool:
         hour = minute_of_day / 60.0
         return 8.0 <= hour < 18.0
+
+    def minutes_until_occupancy_change(self) -> int:
+        """
+        Minutes until the zone's occupancy status next flips. Exposed so
+        the agent can anticipate an upcoming occupied period and preheat
+        in advance - without this, the agent can only react after
+        occupancy already started, which causes a cold-start comfort
+        violation (observed empirically, see BUILD_LOG.md).
+
+        Derives occupancy from `minute_of_day` via `_occupied()` rather
+        than reading `state.occupied`: that flag is only refreshed inside
+        `step()`, so at the moment a control decision is made it still
+        describes the *previous* step. Trusting it made this function
+        report 1440 minutes at exactly 08:00 - the instant occupancy
+        begins - which ordered a setback right as people arrived.
+        """
+        minute_of_day = self.state.minute_of_day
+        if self._occupied(minute_of_day):
+            return (18 * 60) - minute_of_day
+        target = 8 * 60
+        if minute_of_day >= target:
+            target += 24 * 60
+        return target - minute_of_day
 
     def _pmv(self, zone_temp_c: float, occupied: bool) -> float:
         """
@@ -99,15 +135,51 @@ class MockBuilding:
         s.outdoor_temp_c = self._outdoor_temp(s.day, s.minute_of_day)
         s.occupied = self._occupied(s.minute_of_day)
 
-        # Drift zone temp toward outdoor (envelope loss) and setpoint (HVAC),
-        # damped by thermal mass.
-        drift = (self.envelope_loss * (s.outdoor_temp_c - s.zone_temp_c) +
-                 self.hvac_gain * (setpoint - s.zone_temp_c))
+        # Heat the HVAC injects this step. The first term replaces heat lost
+        # through the envelope (what it takes to HOLD the current
+        # temperature); the second closes any remaining gap up to the
+        # setpoint. Capped by hvac_capacity, so warming a cold zone takes
+        # real time and preheating has to start early enough to matter.
+        #
+        # Structuring it this way (rather than a bare proportional term)
+        # means the zone actually converges ON the setpoint. A plain
+        # proportional controller leaves steady-state droop - setpoint 21C
+        # settled at 19.2C - which quietly broke every comfort comparison,
+        # since the baseline's nominal 21C was really delivering 19.2C.
+        envelope_gap = s.zone_temp_c - s.outdoor_temp_c
+        hold = self.envelope_loss * envelope_gap
+        close_gap = self.hvac_gain * (setpoint - s.zone_temp_c)
+        heat_input = max(0.0, min(self.hvac_capacity, hold + close_gap))
+
+        drift = self.envelope_loss * (s.outdoor_temp_c - s.zone_temp_c) + heat_input
         s.zone_temp_c = round(s.zone_temp_c + drift * (1 - self.thermal_mass), 3)
 
-        # Energy proportional to conditioning effort this step (kWh).
-        effort = abs(setpoint - s.zone_temp_c) + abs(drift)
-        s.energy_kwh_step = round(effort * self.hvac_gain * (self.step_minutes / 60.0), 4)
+        # Energy this step (kWh), heating-only degree-day model.
+        #
+        # Two components, and the first one matters:
+        #
+        #   standing_loss - heat continuously escaping through the envelope,
+        #     proportional to how far the zone is held above outdoor. The
+        #     HVAC must keep replacing this just to HOLD a temperature.
+        #   ramp - extra heat to climb toward a setpoint above current temp.
+        #
+        # An earlier version charged only `abs(setpoint - zone_temp)`, which
+        # made holding `setpoint == zone_temp` almost free. That is not how
+        # buildings work, and it was exploitable: the LLM discovered it and
+        # started echoing the current zone temperature back as its setpoint
+        # to zero out its energy score. With standing loss included, a lower
+        # setpoint genuinely costs less (smaller indoor-outdoor gap), which
+        # is what makes unoccupied setback a real saving rather than an
+        # artifact.
+        s.energy_kwh_step = round(heat_input * (self.step_minutes / 60.0), 4)
+
+        # Same kWh costs different amounts and emits different CO2
+        # depending on when it's drawn - this is what makes load shifting
+        # worth anything.
+        s.cost_step = round(s.energy_kwh_step * grid.price_per_kwh(s.minute_of_day), 5)
+        s.carbon_g_step = round(
+            s.energy_kwh_step * grid.carbon_intensity(s.minute_of_day), 2
+        )
 
         s.setpoint_c = setpoint
         s.pmv = self._pmv(s.zone_temp_c, s.occupied)
@@ -139,8 +211,27 @@ TOOL_SCHEMAS = [
             "name": "get_zone_state",
             "description": (
                 "Get the current state of the building zone: temperature, "
-                "outdoor temperature, occupancy, current setpoint, and PMV "
-                "thermal comfort index."
+                "outdoor temperature, occupancy, current setpoint, PMV "
+                "thermal comfort index, and minutes_until_occupancy_change "
+                "(minutes until the zone flips from unoccupied to occupied, "
+                "or vice versa - use this to preheat before occupancy starts "
+                "instead of waiting until people have already arrived)."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_grid_forecast",
+            "description": (
+                "Get electricity price and grid carbon intensity for the "
+                "next few hours. Power is cheapest and cleanest overnight "
+                "and around midday, and most expensive and most carbon "
+                "intensive during the evening peak. Use this to decide "
+                "WHEN to heat: heating early, while power is cheap, stores "
+                "warmth in the building's thermal mass and lets you coast "
+                "through the expensive peak without running the HVAC."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -183,9 +274,29 @@ class ToolExecutor:
             "zone_temp_c": s.zone_temp_c,
             "outdoor_temp_c": s.outdoor_temp_c,
             "setpoint_c": s.setpoint_c,
-            "occupied": s.occupied,
+            # Derived from the clock, not `s.occupied`, for the same
+            # staleness reason as minutes_until_occupancy_change: the
+            # stored flag lags by one step at the moment a decision is
+            # made, so at 08:00 it still says the zone is empty.
+            "occupied": self.building._occupied(s.minute_of_day),
             "pmv": s.pmv,
             "comfort_band_c": [COMFORT_MIN_C, COMFORT_MAX_C],
+            "minutes_until_occupancy_change": self.building.minutes_until_occupancy_change(),
+            "price_per_kwh_now": grid.price_per_kwh(s.minute_of_day),
+            "carbon_g_per_kwh_now": grid.carbon_intensity(s.minute_of_day),
+            "minutes_until_price_peak": grid.minutes_until_peak(s.minute_of_day),
+        }
+
+    def get_grid_forecast(self) -> dict:
+        m = self.building.state.minute_of_day
+        return {
+            "now": {
+                "price_per_kwh": grid.price_per_kwh(m),
+                "carbon_g_per_kwh": grid.carbon_intensity(m),
+                "is_peak": grid.is_peak(m),
+            },
+            "minutes_until_price_peak": grid.minutes_until_peak(m),
+            "forecast": grid.forecast(m, hours=6),
         }
 
     def set_zone_setpoint(self, setpoint_c: float) -> dict:
@@ -201,6 +312,8 @@ class ToolExecutor:
     def dispatch(self, name: str, arguments: dict) -> dict:
         if name == "get_zone_state":
             return self.get_zone_state()
+        if name == "get_grid_forecast":
+            return self.get_grid_forecast()
         if name == "set_zone_setpoint":
             return self.set_zone_setpoint(**arguments)
         raise ValueError(f"Unknown tool: {name}")

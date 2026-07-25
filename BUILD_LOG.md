@@ -115,6 +115,192 @@ actually existed. Built from scratch following the plan's own strategy.
   in case a different, higher-RAM/VRAM machine is used later — just pass
   `--model qwen2.5-coder:7b` there.
 
+- **1.5B model doesn't reliably use Ollama's structured tool-calling
+  (fixed 2026-07-25).** First `mock-ai` run: setpoint never left the
+  default 21°C across 24 steps. Root cause: `ollama show qwen2.5-coder:1.5b
+  --template` requires the model to wrap tool calls in
+  `<tool_call>...</tool_call>` tags for Ollama's parser to populate
+  `message.tool_calls`; the 1.5B model instead dumps JSON-ish text
+  (sometimes markdown-fenced, sometimes with `"arguments": null` or
+  `"arguments"` as a JSON-encoded string, sometimes multiple JSON objects
+  concatenated) directly into `message.content`, which the loop was
+  treating as final reasoning text and discarding. Fixed by adding
+  `_parse_fallback_tool_calls()` in `llm_agent.py`: scans message content
+  for balanced-brace JSON objects, matches ones with a recognized tool
+  `name`, and normalizes malformed `arguments`. Verified against all the
+  malformed patterns actually observed - see git history of
+  `llm_agent.py` for the exact test. After the fix, setpoints actually
+  changed (18/24/23/20/24.5°C across a 6h test) instead of flatlining.
+
+- **Setpoint oscillation with no clear driver (fixed 2026-07-25).** The
+  6h test above ran entirely during unoccupied hours (PMV=0 throughout,
+  no comfort signal to react to) and the model still swung the setpoint
+  almost every cycle (21→18→24→23→20→24.5°C) for no evident reason -
+  exactly the "setpoints oscillating every cycle" failure mode PLAN.md
+  warns about, and it costs energy (each swing re-chases a new target).
+  Tightened `SYSTEM_PROMPT` in `llm_agent.py` to explicitly say: while
+  unoccupied, hold one steady low setback value and don't change it
+  without a real reason; re-calling `set_zone_setpoint` with the same
+  value is fine and expected. **Re-verify this actually reduced
+  oscillation** by checking the next full 24h `mock-ai` run's
+  `setpoint_c` column during unoccupied hours - it should look mostly
+  flat, not jumping every cycle.
+
+- **AI run used MORE energy than baseline despite zero comfort violations
+  (fixed 2026-07-25, needs re-verification).** First post-fix 24h run:
+  AI = 14.35 kWh vs baseline 12.6 kWh (-13.9%, i.e. worse), but 0 comfort
+  violations vs baseline's 11. Root cause: the model held unoccupied
+  setpoints around 23-24C instead of near the safe range's low end - it
+  followed "stay steady" but not "stay low," because "near the low end of
+  the safe range" is too vague for a 1.5B model to translate into an
+  actual number. Fixed by making `SYSTEM_PROMPT` state the unoccupied
+  setback explicitly as `18.0C`, not a description. **Needs
+  re-verification** against a fresh 24h run's kWh totals and comfort
+  violations once the run below completes.
+
+- **A single agent call hung indefinitely (fixed 2026-07-25).** During
+  the re-verification run above, one LLM call apparently fell into a
+  degenerate repetition loop (no output, `ollama ps` stuck showing
+  "Stopping..." for 10+ minutes, `python3.13.exe`'s Ollama subprocess CPU
+  time still climbing - so not deadlocked, just generating tokens
+  forever) - the `ollama.chat()` call had no cap on response length or
+  request timeout, so nothing would stop it. Fixed in `llm_agent.py`:
+  added `options={"num_predict": 300}` to the chat call (hard cap on
+  generated tokens per turn) and `ollama.Client(timeout=60)` (HTTP-level
+  timeout as a second safety net). If a run ever hangs again, check
+  `ollama ps` - if `UNTIL` is stuck (not counting down and not showing a
+  future unload time) for more than ~30s past a call's usual latency,
+  it's this failure mode, not a real hang in our own code.
+
+- **CSV log unreadable by pandas (fixed 2026-07-25).** After the hang-fix
+  re-run completed cleanly, `pandas.read_csv('logs/mock-ai.csv')` failed
+  with `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb0` - the
+  model's free-form reasoning text apparently included a `°` character,
+  and `run_loop.py::open_log()` opened the file with `open(path, "w",
+  newline="")` and no explicit encoding, which defaults to the Windows
+  locale codepage (cp1252) rather than UTF-8. cp1252 encodes `°` as byte
+  `0xB0`, which isn't valid UTF-8, so it wrote fine but failed to read
+  back. Fixed by adding `encoding="utf-8"` to that `open()` call. **Any
+  log file written before this fix (i.e. `logs/mock-ai.csv` from the
+  hang-fix re-run) is corrupt and must be regenerated**, not just re-read.
+
+- **Agent couldn't anticipate occupancy, causing a severe cold-start
+  comfort violation (fixed 2026-07-25).** After the encoding fix, a clean
+  24h run showed the agent holding 18.0C right through the start of
+  occupancy, only reacting afterward - PMV dropped to -2.62 (way past the
+  -1.0 to 1.0 bound) and stayed in violation for ~4 hours (16/40 occupied
+  steps). This was worse than the very first "zero violations" run, which
+  in hindsight wasn't real anticipation - the model just happened to
+  already be at a warm setpoint from earlier oscillation, before that got
+  fixed. Root cause: `get_zone_state` gave the agent no way to know
+  occupancy was *about to* start - it could only react after the fact,
+  never anticipate. Fixed by adding
+  `MockBuilding.minutes_until_occupancy_change()` (`tools.py`), exposing
+  it in `get_zone_state`'s return value and its tool-schema description,
+  and adding an explicit, numeric rule to `SYSTEM_PROMPT`: preheat to
+  21.5C when unoccupied with <=120 minutes until occupancy starts,
+  otherwise hold 18.0C. **Needs re-verification** against the run below -
+  check PMV no longer excurses sharply at occupancy start.
+
+- **CONCLUSION: qwen2.5-coder:1.5b cannot do this task (2026-07-25).**
+  After five prompt iterations produced, in order: setpoints stuck at
+  default; random oscillation; energy 13.9% WORSE than baseline; 40/40
+  occupied steps in comfort violation; and finally a setpoint of `18.915`
+  - a value appearing nowhere in the prompt, which permitted only 18.0 or
+  22.0, and which is exactly the zone temperature from the preceding step
+  echoed back as a setpoint. Decisive isolated test: given a zone with
+  `occupied=true, pmv=-2.3` and a prompt whose RULE 1 reads
+  `occupied is true -> setpoint 22.0`, the model returned
+  `set_zone_setpoint(18.0)`. **Do not spend further effort on prompt
+  wording** - there is no phrasing this model will follow more literally
+  than the one it ignored. Also fixed along the way: `temperature: 0.0`
+  and `seed: 42` in `llm_agent.py`'s chat options, because at Ollama's
+  default sampling temperature identical code produced wildly different
+  24h outcomes, making every comparison meaningless.
+
+- **Added deterministic supervisory override layer (`supervisor.py`,
+  2026-07-25).** User's chosen path forward. The agent proposes a
+  setpoint; `supervise()` vetoes proposals that are physically
+  indefensible and substitutes a safe value. Three override triggers
+  only: (1) occupied zone outside the comfort band with a proposal that
+  doesn't target the band, (2) occupancy within `PREHEAT_LEAD_MINUTES`
+  with a proposal too low to preheat, (3) empty building with occupancy
+  not imminent and a proposal above setback. Anything merely suboptimal
+  is left alone, so the agent keeps real authority whenever its choice is
+  defensible.
+  - **Honesty requirement, do not remove**: `OverrideStats` tracks the
+    intervention rate, `run_loop.py` logs `agent_proposed_c`,
+    `overridden`, and `override_reason` per step, and the dashboard
+    displays the override percentage with a caption stating that a high
+    rate means the results reflect the rules rather than the LLM. A
+    `--no-supervisor` flag measures unassisted agent quality. Reporting
+    savings from this setup *without* the override rate would
+    misrepresent what the agent achieved - it is the difference between
+    a defensible engineering pattern (real BMS systems do exactly this)
+    and overstating the LLM's contribution.
+  - **Bug caught by its own unit test**: the first version checked
+    `proposed > zone_temp` to decide whether a proposal was "correcting"
+    a cold zone, which let the original failure (setpoint parked at 18.0C
+    in a 17.5C occupied zone) pass as valid - 18.0 > 17.5, but 18.0 can
+    never reach the 20.0C comfort floor. Fixed to test against the
+    comfort band, not the current temperature. All 10 supervisor cases
+    now pass; re-run that test after touching `supervise()`.
+
+- **The mock energy model was unphysical and exploitable (fixed
+  2026-07-25).** It charged `abs(setpoint - zone_temp) + abs(drift)`,
+  so holding `setpoint == zone_temp` cost almost nothing - but real
+  buildings bleed heat continuously and the HVAC must keep replacing it.
+  This is what the LLM's bizarre `18.915` output was: it had found the
+  exploit and was echoing the current zone temperature back to zero out
+  its energy score. Replaced with a heating-only degree-day model:
+  `heat_input = clamp(0, capacity, envelope_loss*(zone-outdoor) +
+  hvac_gain*(setpoint-zone))`, energy = heat_input * hours. Verified:
+  energy now rises monotonically with setpoint, and setting
+  setpoint == zone_temp still costs standing loss. **Every energy number
+  measured before this fix is meaningless** - they were scored against a
+  broken metric.
+
+- **Controller had steady-state droop (fixed 2026-07-25).** The plain
+  proportional term meant a 21.0C setpoint settled the zone at 19.2C, so
+  the baseline's nominal 21C was really delivering 19.2C and every
+  comfort comparison was skewed. The new formulation (offset envelope
+  loss, then close the remaining gap, capped by `hvac_capacity`)
+  converges on the setpoint exactly - measured droop now 0.00C.
+
+- **`occupied` and `minutes_until_occupancy_change` were stale at
+  decision time (fixed 2026-07-25).** Both read `state.occupied`, which
+  is only refreshed inside `step()`, so at the moment a control decision
+  was made it described the *previous* step. At exactly 08:00 this made
+  the horizon report 1440 minutes instead of 0 and ordered a setback just
+  as occupancy began - the direct cause of the last remaining comfort
+  violation. Both now derive occupancy from `minute_of_day` via
+  `_occupied()`. Boundary behaviour verified at 07:45/08:00/08:15 and
+  17:45/18:00/18:15.
+
+- **KEY RESULT: there is almost no energy headroom in this model
+  (2026-07-25).** With the physics corrected, comparing the supervisor
+  rules against the fixed-schedule baseline over 48h:
+  - rules: **0/80 comfort violations**, baseline: **8/80**
+  - energy: rules **-0.5%** vs baseline (i.e. marginally worse)
+  Swept across climates (base outdoor 14C / 8C / 2C / -4C) the energy
+  difference stays within +-1% every time. `OPTIMAL_STOP_MINUTES` was
+  measured to save exactly 0.00 kWh here (afternoon outdoor temp exceeds
+  the indoor target, so heating is already off before the coast window).
+  Interpretation: a well-chosen fixed setback schedule (21C occupied /
+  18C setback) already captures nearly all available savings in a
+  single-zone building with static occupancy. The honest framing of the
+  result is **"strictly better comfort (8 violations -> 0) at
+  approximately equal energy"**, not an energy-savings headline.
+  - **Implication for the demo**: to show meaningful savings, the
+    scenario needs something a static schedule *cannot* exploit. The
+    brief explicitly names two: **peak demand thresholds** and **local
+    carbon grid intensity**. Adding a time-varying price/carbon signal
+    creates real optimization headroom (shift preheating into cheap or
+    low-carbon hours, coast through peaks) that no fixed schedule can
+    capture. That is the recommended next move, not further tuning of
+    these constants - the constants are already at their measured
+    optimum and tuning them further is just fitting the benchmark.
+
 ## Next steps (in order)
 
 1. Confirm `qwen2.5-coder:7b` finished downloading (`ollama list`) and

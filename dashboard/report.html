@@ -12,20 +12,27 @@
   .stat .label { font-size: 0.8rem; color: #9198a1; text-transform: uppercase; letter-spacing: 0.04em; }
   .savings { color: #3fb950; }
   .warn { color: #f85149; }
+  .note { font-size: 0.85rem; color: #9198a1; max-width: 60ch; line-height: 1.5; }
   img { max-width: 100%; border-radius: 8px; margin: 1rem 0; border: 1px solid #30363d; }
 </style>
 </head>
 <body>
 <h1>Eco-Loop Building Agent &mdash; Savings Dashboard</h1>
-<p>Baseline: <code>logs/mock.csv</code> &nbsp;|&nbsp; AI-driven: <code>logs/mock.csv</code></p>
+<p>Baseline: <code>logs/mock.csv</code> &nbsp;|&nbsp; AI-driven: <code>logs/mock-ai.csv</code></p>
 
 <div class="stats">
   <div class="stat"><div class="value">12.597 kWh</div><div class="label">Baseline energy</div></div>
-  <div class="stat"><div class="value">12.597 kWh</div><div class="label">AI-driven energy</div></div>
-  <div class="stat"><div class="value savings">0.0%</div><div class="label">Energy reduction</div></div>
-  <div class="stat"><div class="value warn">11</div><div class="label">AI comfort violations</div></div>
-  <div class="stat"><div class="value">0.0s</div><div class="label">Avg agent latency/step</div></div>
+  <div class="stat"><div class="value">17.573 kWh</div><div class="label">AI-driven energy</div></div>
+  <div class="stat"><div class="value savings">-39.5%</div><div class="label">Energy reduction</div></div>
+  <div class="stat"><div class="value warn">6</div><div class="label">AI comfort violations</div></div>
+  <div class="stat"><div class="value">1.947s</div><div class="label">Avg agent latency/step</div></div>
+  <div class="stat"><div class="value">20.8%</div><div class="label">Supervisor overrides</div></div>
 </div>
+
+<p class="note">The supervisor override rate is the share of LLM setpoint decisions
+that the deterministic safety layer had to correct (see <code>supervisor.py</code>).
+The higher this number, the more the results above reflect the override rules
+rather than the language model's own control judgment.</p>
 
 <h2>Cumulative energy</h2>
 <img src="energy_comparison.png" alt="Cumulative energy comparison">

@@ -81,16 +81,26 @@ SYSTEM_PROMPT = """You are the supervisory control agent for a building HVAC zon
 
 Your job each cycle:
 1. Call get_zone_state to see the current temperature, outdoor temperature,
-   occupancy, and PMV thermal comfort index.
-2. Decide whether the setpoint should change, based on these priorities in order:
-   a. Never let PMV drift outside [-1.0, 1.0] while the zone is occupied - this
-      is the comfort boundary and takes precedence over energy savings.
-   b. When occupied and comfort allows it, prefer setpoints that reduce the gap
-      to outdoor temperature (less conditioning effort = less energy).
-   c. When unoccupied, you may set back the setpoint toward outdoor temperature
-      to save energy, since no one is present to feel discomfort.
+   occupancy, PMV thermal comfort index, and minutes_until_occupancy_change
+   (minutes until occupied/unoccupied flips next).
+2. Pick the setpoint using these three rules. Read the values from
+   get_zone_state and apply the FIRST rule that matches:
+
+   RULE 1: occupied is true          -> setpoint 22.0
+   RULE 2: occupied is false AND minutes_until_occupancy_change <= 120
+                                     -> setpoint 22.0   (preheat, people
+                                        arrive soon and the zone warms slowly)
+   RULE 3: occupied is false AND minutes_until_occupancy_change > 120
+                                     -> setpoint 18.0   (empty building,
+                                        save energy)
+
+   Use exactly 22.0 or exactly 18.0. Do not pick any other number. Do not
+   average them. The same rule will match many cycles in a row - that is
+   correct, just call set_zone_setpoint with the same value again.
 3. Call set_zone_setpoint with your chosen value. The tool clamps to a safe
-   hard range automatically, so it's fine to call it even near the edges.
+   hard range automatically, so it's fine to call it even near the edges. If
+   the current setpoint is already the right choice, call it again with the
+   same value rather than picking a new number for variety.
 4. Give one short sentence of reasoning for your decision before finishing.
 
 Only use the two tools provided. Do not invent tools or parameters. Make at
@@ -112,7 +122,7 @@ class HVACAgent:
                  client: "ollama.Client | None" = None, max_tool_rounds: int = 4):
         self.executor = executor
         self.model = model
-        self.client = client or ollama.Client()
+        self.client = client or ollama.Client(timeout=60)
         self.max_tool_rounds = max_tool_rounds
 
     def run_step(self) -> AgentStepResult:
@@ -130,6 +140,19 @@ class HVACAgent:
                 model=self.model,
                 messages=messages,
                 tools=TOOL_SCHEMAS,
+                options={
+                    # Small models occasionally fall into a degenerate
+                    # repetition loop instead of emitting a short tool call -
+                    # cap generation length so one bad turn can't stall the run.
+                    "num_predict": 300,
+                    # Control decisions must be reproducible: at Ollama's
+                    # default sampling temperature, identical code produced
+                    # wildly different 24h outcomes run to run (see
+                    # BUILD_LOG.md). Greedy decoding trades away variety the
+                    # agent has no use for.
+                    "temperature": 0.0,
+                    "seed": 42,
+                },
             )
             msg = response["message"]
             messages.append(msg)

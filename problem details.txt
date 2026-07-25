@@ -9,21 +9,17 @@ Technical Core Requirements
 1. The Simulation Engine (EnergyPlus)
 
 Utilize EnergyPlus to run high-fidelity building energy simulations.
-
 You may use functional libraries (e.g., eppy, PyEnergyPlus, or EMS/BCVTB) to bridge Python or execution runtimes with the underlying Input Data File (.idf) or Functional Mock-up Units (fmu).
 
 2. The Cognitive Engine & Protocol (OSS LLM & MCP)
 
 Deploy any modern Open-Source LLM (e.g., Llama 3, Mistral, Qwen) running locally or via a self-hosted API.
-
 Implement an MCP Server or custom agentic tools. The LLM must use these tools to parse files, extract runtime errors, and execute tasks without human code modification.
 
 3. Closed-Loop Execution Framework
 
 Feedback (EnergyPlus → Al): The simulation must stream continuous performance metrics (e.g., zone temperatures, indoor air quality, energy consumption, Predicted Mean Vote (PMV) thermal comfort indices).
-
 Reasoning: The LLM evaluates this data against predefined targets like occupancy comfort, peak demand thresholds, and local carbon grid intensity.
-
 Control Actions (Al→ EnergyPlus): The LLM calculates optimal Energy Conservation Measures (ECMs) and updates dynamic set-points.
 
 Forward Injection: The computed set-points and supervisory overrides must automatically feed directly back into the active EnergyPlus instance
