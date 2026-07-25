@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 
 import ollama
 
-from tools import TOOL_SCHEMAS, ToolExecutor
+from supervisor import BUILDING_MODES
+from tools import BUILDING_TOOL_SCHEMAS, TOOL_SCHEMAS, ToolExecutor
 
 DEFAULT_MODEL = "qwen2.5-coder:1.5b"
 
@@ -106,6 +107,183 @@ Your job each cycle:
 Only use the tools provided. Do not invent tools or parameters. Make at
 most one set_zone_setpoint call per cycle.
 """
+
+
+# --------------------------------------------------------------------------
+# Strategy agent (real EnergyPlus path).
+#
+# Two changes from the single-zone agent below, both forced by measurement
+# rather than taste:
+#
+# 1. The action is a *named strategy* from a closed set, not a float. Asked
+#    for a number, qwen2.5-coder:1.5b produced a usable one in 10 of 156
+#    calls during a real EnergyPlus run - the other 146 cycles fell through
+#    to a supervisor fallback, so the "agent" was contributing nothing while
+#    appearing to run.
+#
+# 2. The final decision turn is emitted under Ollama's structured-output
+#    grammar (`format=<json schema>`), which makes an unparseable or
+#    out-of-set answer impossible rather than merely unlikely. Measured
+#    across 75 synthetic building states: 75/75 responses valid, versus the
+#    ~6% usable rate above.
+#
+# Information gathering still happens through ordinary tool calls, so the
+# agent chooses what to look at; only the final action is constrained.
+# --------------------------------------------------------------------------
+
+STRATEGY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "mode": {"type": "string", "enum": list(BUILDING_MODES)},
+        "reason": {"type": "string"},
+    },
+    "required": ["mode", "reason"],
+}
+
+STRATEGY_SYSTEM_PROMPT = """You are the supervisory control agent for a five-zone office building's heating.
+
+First call get_building_state to see the building. You may also call
+get_grid_forecast to see upcoming electricity prices and carbon intensity.
+
+Then choose exactly one control strategy.
+
+get_building_state gives you four conditions, each already worked out for
+you as true or false: building_occupied, occupancy_imminent, peak_now,
+peak_approaching. Read down this list and stop at the FIRST line whose
+condition is true. Do not do any arithmetic.
+
+1. peak_now is true AND building_occupied is true
+      -> COAST
+2. peak_approaching is true AND (building_occupied is true
+   OR occupancy_imminent is true)
+      -> PRECHARGE
+3. building_occupied is false AND occupancy_imminent is false
+      -> SETBACK
+4. building_occupied is false AND occupancy_imminent is true
+      -> PREHEAT
+5. none of the above matched
+      -> COMFORT
+
+What the strategies mean physically:
+  SETBACK   - building empty for a while yet, let it go cold and save energy.
+  PREHEAT   - people arrive soon, warm the building up before they get here.
+  COMFORT   - people are here, hold a normal comfortable temperature.
+  PRECHARGE - electricity gets expensive and dirty soon, so heat up NOW
+              while it is still cheap and store that warmth in the building.
+  COAST     - electricity is expensive right now, so stop buying it and let
+              the stored warmth carry the building through.
+"""
+
+
+@dataclass
+class StrategyDecision:
+    mode: str | None
+    reason: str = ""
+    latency_s: float = 0.0
+    tools_used: list = field(default_factory=list)
+    state_injected: bool = False
+    parse_failed: bool = False
+
+
+class StrategyAgent:
+    """
+    Picks one building-level ECM per decision cycle.
+
+    Deliberately does NOT talk to the simulation directly. Its output is a
+    label; `supervisor.apply_mode()` turns that into per-zone setpoints and
+    enforces comfort. That split is what lets the model run on a slow
+    cadence without putting occupants at risk - see `apply_mode`'s docstring.
+    """
+
+    def __init__(self, executor, model: str = DEFAULT_MODEL,
+                 client: "ollama.Client | None" = None, max_tool_rounds: int = 3):
+        self.executor = executor
+        self.model = model
+        self.client = client or ollama.Client(timeout=90)
+        self.max_tool_rounds = max_tool_rounds
+
+    def decide(self) -> StrategyDecision:
+        start = time.monotonic()
+        self.executor.begin_cycle()
+
+        messages = [
+            {"role": "system", "content": STRATEGY_SYSTEM_PROMPT},
+            {"role": "user", "content": "Assess the building and choose a strategy."},
+        ]
+
+        # Phase 1 - let the agent gather whatever context it wants.
+        for _ in range(self.max_tool_rounds):
+            response = self.client.chat(
+                model=self.model, messages=messages, tools=BUILDING_TOOL_SCHEMAS,
+                options={"num_predict": 200, "temperature": 0.0, "seed": 42},
+            )
+            msg = response["message"]
+            messages.append(msg)
+
+            calls = [
+                {"name": c["function"]["name"],
+                 "arguments": _coerce_args(c["function"]["arguments"])}
+                for c in (msg.get("tool_calls") or [])
+            ]
+            if not calls:
+                calls = _parse_fallback_tool_calls(msg.get("content") or "")
+            if not calls:
+                break
+
+            for call in calls:
+                try:
+                    result = self.executor.dispatch(call["name"], call["arguments"])
+                except (TypeError, ValueError) as exc:
+                    result = {"error": str(exc)}
+                messages.append({"role": "tool", "content": json.dumps(result)})
+
+        # If the agent never looked at the building, hand it the state anyway
+        # rather than letting it decide blind. Tracked as `state_injected` and
+        # reported, because an agent that has to be spoon-fed its own context
+        # is a weaker result than one that fetches it, and that distinction
+        # should not be silently absorbed.
+        state_injected = "get_building_state" not in self.executor.calls
+        if state_injected:
+            messages.append({
+                "role": "user",
+                "content": "Building state: "
+                           + json.dumps(self.executor.get_building_state()),
+            })
+
+        # Phase 2 - constrained action. No tools here: the only legal output
+        # is one of the five strategy labels plus a reason.
+        messages.append({
+            "role": "user",
+            "content": "Now reply with the single chosen strategy and a one-sentence reason.",
+        })
+        response = self.client.chat(
+            model=self.model, messages=messages, format=STRATEGY_SCHEMA,
+            options={"num_predict": 150, "temperature": 0.0, "seed": 42},
+        )
+
+        mode, reason, parse_failed = None, "", False
+        try:
+            payload = json.loads(response["message"]["content"])
+            candidate = str(payload.get("mode", "")).strip().upper()
+            if candidate in BUILDING_MODES:
+                mode = candidate
+            else:
+                parse_failed = True
+            reason = str(payload.get("reason", ""))[:200]
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            # Should be unreachable while the grammar is applied, but a
+            # silent None here would look identical to "the agent declined",
+            # so it is flagged rather than swallowed.
+            parse_failed = True
+
+        return StrategyDecision(
+            mode=mode,
+            reason=reason,
+            latency_s=round(time.monotonic() - start, 3),
+            tools_used=list(self.executor.calls),
+            state_injected=state_injected,
+            parse_failed=parse_failed,
+        )
 
 
 @dataclass

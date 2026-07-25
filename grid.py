@@ -44,6 +44,18 @@ PEAK_CARBON = 480.0
 PEAK_START_HOUR = 16
 PEAK_END_HOUR = 21
 
+# Natural gas, for whatever share of site energy is still gas-fired.
+#
+# Flat, and that flatness is the point: gas is billed per unit with no
+# time-of-use structure and burns at a fixed emissions factor, so moving gas
+# consumption around in time changes neither cost nor carbon. That is
+# precisely why `make_week_idf.py` electrifies the boiler - a controller
+# whose main strategy is "heat at a better hour" has nothing to optimise
+# against a flat signal. These constants remain so that any residual gas use
+# is still accounted for rather than silently valued at zero.
+GAS_PRICE_PER_KWH = 0.045
+GAS_CARBON_G_PER_KWH = 185.0
+
 
 def _hour(minute_of_day: int) -> float:
     return (minute_of_day % (24 * 60)) / 60.0

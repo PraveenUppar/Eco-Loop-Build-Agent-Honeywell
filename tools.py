@@ -30,7 +30,15 @@ import grid
 # range, regardless of what it asks for. This is what Hour 3-7's
 # "confirm the comfort clamp actually rejects out-of-band requests" step
 # is checking.
-MIN_SETPOINT_C = 18.0
+#
+# The floor is freeze protection, not a comfort number: it exists to stop
+# any strategy - or any model output - from letting an empty building
+# approach pipe-freezing conditions. It sits below the deepest setback the
+# controller will ever deliberately command (16.0C, see
+# supervisor.DEEP_SETBACK_C) precisely so that the rail and the strategy
+# are independent. A rail set at the strategy's own value silently stops
+# being a rail.
+MIN_SETPOINT_C = 15.0
 MAX_SETPOINT_C = 26.0
 
 # Comfort band used for the dashboard's "did AI violate comfort" check.
@@ -338,3 +346,122 @@ class ToolExecutor:
         situation-appropriate fallback instead of a stale number.
         """
         return self._pending_setpoint
+
+
+# --------------------------------------------------------------------------
+# Building-level tools (real EnergyPlus path).
+#
+# The single-zone tools above hand the agent a raw thermostat to write to.
+# For a five-zone building that scales badly in both directions: the agent
+# would need five numeric decisions per cycle, and each one would be an
+# independent chance for a small model to emit something unusable.
+#
+# These tools instead expose the building as one aggregate and take one
+# named strategy back. Per-zone setpoints are then derived deterministically
+# by supervisor.apply_mode(), which also enforces comfort per zone on every
+# timestep. The agent decides policy; the supervisor handles physics.
+# --------------------------------------------------------------------------
+
+BUILDING_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_building_state",
+            "description": (
+                "Get the current state of the whole building: how many zones "
+                "are occupied, the coldest and average zone temperature, "
+                "outdoor temperature, and four pre-evaluated conditions - "
+                "building_occupied, occupancy_imminent, peak_now, "
+                "peak_approaching - each already computed as true or false."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_grid_forecast",
+            "description": (
+                "Get electricity price and grid carbon intensity for the next "
+                "few hours. Power is cheapest and cleanest overnight and around "
+                "midday, and most expensive and most carbon intensive during "
+                "the evening peak. Heating early, while power is cheap, stores "
+                "warmth in the building's thermal mass and lets the building "
+                "coast through the expensive peak with the heating idle."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+
+class BuildingToolExecutor:
+    """
+    Serves building-level state read out of the running EnergyPlus model.
+
+    `update()` is called by the run loop with the values it just read from
+    the simulation, immediately before the agent is invoked - so a
+    `get_building_state` call always reflects the live simulation rather
+    than a stale or synthetic snapshot.
+    """
+
+    def __init__(self):
+        self._state: dict = {}
+        self.calls: list[str] = []
+
+    def update(self, state: dict) -> None:
+        self._state = dict(state)
+
+    def get_building_state(self) -> dict:
+        return dict(self._state)
+
+    def get_grid_forecast(self) -> dict:
+        minute = int(self._state.get("minute_of_day", 0))
+        return {
+            "now": {
+                "price_per_kwh": grid.price_per_kwh(minute),
+                "carbon_g_per_kwh": grid.carbon_intensity(minute),
+                "is_peak": grid.is_peak(minute),
+            },
+            "minutes_until_price_peak": grid.minutes_until_peak(minute),
+            "forecast": grid.forecast(minute, hours=6),
+        }
+
+    def begin_cycle(self) -> None:
+        self.calls = []
+
+    def dispatch(self, name: str, arguments: dict) -> dict:
+        self.calls.append(name)
+        if name == "get_building_state":
+            return self.get_building_state()
+        if name == "get_grid_forecast":
+            return self.get_grid_forecast()
+        raise ValueError(f"Unknown tool: {name}")
+
+
+class LiveStateExecutor(ToolExecutor):
+    """
+    ToolExecutor whose `get_zone_state` serves externally-supplied state.
+
+    Used for the real EnergyPlus modes. Previously those built a
+    `ToolExecutor(MockBuilding())`, so when the LLM called
+    `get_zone_state` it received a mock building that was never stepped -
+    frozen at its initial values. The agent was reasoning about a
+    stationary toy while EnergyPlus ran separately, which defeats the
+    point of the closed loop.
+
+    The run loop calls `update(state)` with the values it just read out of
+    EnergyPlus, immediately before invoking the agent.
+    """
+
+    def __init__(self, building: MockBuilding):
+        super().__init__(building)
+        self._live: dict | None = None
+
+    def update(self, state: dict) -> None:
+        self._live = dict(state)
+
+    def get_zone_state(self) -> dict:
+        if self._live is None:
+            return super().get_zone_state()
+        return dict(self._live)
