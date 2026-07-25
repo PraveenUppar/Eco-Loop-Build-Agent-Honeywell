@@ -8,12 +8,19 @@ a safe band. See [PLAN.md](PLAN.md) for the build plan and
 
 ## Status
 
-- Mock-mode closed loop (lightweight thermal simulator standing in for
-  EnergyPlus): **built**, see `tools.py` / `llm_agent.py` / `run_loop.py`.
-- Real EnergyPlus integration: **not wired yet** — EnergyPlus isn't
-  installed on this machine. `run_real_energyplus()` in `run_loop.py` has
-  the integration scaffolded with explicit `TODO`s for the zone/actuator
-  handles (Hour 7-13 in PLAN.md).
+- **Mock-mode closed loop: built and measured.** Over 48 simulated hours
+  against a fixed setback schedule: cost −4.0 %, carbon −2.1 %,
+  peak-hour energy −23.3 %, comfort violations 8/80 → 0/80.
+- **Real EnergyPlus integration: written, not yet executed.**
+  `run_real_energyplus()` is fully implemented (handle resolution, meter
+  reads, actuator writes, same supervisor). It has not been run, because
+  EnergyPlus is not installed on the development machine — so treat it as
+  untested code until you complete the steps below.
+- **Honest caveat on the results:** the supervisor override rate is
+  95.8 %, meaning the deterministic rules produce nearly all of the
+  benefit and the 1.5B model contributes little. See
+  [ARCHITECTURE.md](ARCHITECTURE.md) §3 and §7 — the capability probe and
+  the no-LLM control arm are both documented there.
 
 ## Setup
 
@@ -38,28 +45,55 @@ python dashboard/generate_report.py --baseline logs/mock.csv --ai logs/mock-ai.c
 
 Open `dashboard/report.html` for the savings/comfort summary.
 
-## Running (real EnergyPlus — once installed)
+## Running (real EnergyPlus)
 
-1. Install EnergyPlus, then add its install directory to `PYTHONPATH` so
-   `pyenergyplus` is importable:
-   ```bash
-   export PYTHONPATH=$PYTHONPATH:/usr/local/EnergyPlus-24-1-0
-   ```
-2. Find an example IDF (EnergyPlus ships examples), e.g.:
-   ```bash
-   find /usr/local/EnergyPlus-* -iname "*SmallOffice*.idf"
-   ```
-   Copy it and its matching `.epw` weather file into `models/`.
-3. Open the IDF and note the `Zone` object name(s) and the
-   `Schedule:Compact` object used for the thermostat setpoint — fill
-   these into the `TODO` block in `run_real_energyplus()` in
-   [run_loop.py](run_loop.py).
-4. Run baseline, then AI:
-   ```bash
-   python run_loop.py --mode baseline --idf models/baseline.idf --epw models/weather.epw
-   python run_loop.py --mode ai       --idf models/baseline.idf --epw models/weather.epw
-   python dashboard/generate_report.py --baseline logs/baseline.csv --ai logs/ai.csv
-   ```
+**1. Install EnergyPlus** from [energyplus.net/downloads](https://energyplus.net/downloads),
+then point `PYTHONPATH` at the install directory so `pyenergyplus` is importable:
+
+```powershell
+$env:PYTHONPATH = "C:\EnergyPlusV24-1-0"
+```
+
+```bash
+export PYTHONPATH=$PYTHONPATH:/usr/local/EnergyPlus-24-1-0
+```
+
+Verify with `python -c "import pyenergyplus; print('ok')"`.
+
+**2. Copy an example model.** EnergyPlus ships example files in
+`ExampleFiles/` and weather in `WeatherData/`:
+
+```powershell
+copy "C:\EnergyPlusV24-1-0\ExampleFiles\RefBldgSmallOfficeNew2004_Chicago.idf" models\baseline.idf
+copy "C:\EnergyPlusV24-1-0\WeatherData\USA_IL_Chicago-OHare.Intl.AP.725300_TMY3.epw" models\weather.epw
+```
+
+**3. Find the zone name.** Zone names differ between models and are not
+guessable — ask the model itself rather than reading the IDF by hand:
+
+```bash
+python run_loop.py --mode discover --idf models/baseline.idf --epw models/weather.epw
+```
+
+This prints every zone and writes the full actuator list to
+`out/discover/eplusout.edd`.
+
+**4. Run baseline, then AI**, passing the zone name from step 3:
+
+```bash
+python run_loop.py --mode baseline --idf models/baseline.idf --epw models/weather.epw --zone "CORE_ZN ZN"
+```
+
+```bash
+python run_loop.py --mode ai --idf models/baseline.idf --epw models/weather.epw --zone "CORE_ZN ZN"
+```
+
+```bash
+python dashboard/generate_report.py --baseline logs/baseline.csv --ai logs/ai.csv
+```
+
+If the log comes out empty, the zone name didn't match — the run prints a
+warning naming the unresolved handles. Re-check step 3.
 
 ## Safety
 
