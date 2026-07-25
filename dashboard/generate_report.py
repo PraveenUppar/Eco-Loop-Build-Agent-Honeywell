@@ -122,14 +122,48 @@ def make_charts(baseline: pd.DataFrame, ai: pd.DataFrame, out_dir: str) -> dict:
     plt.close(fig)
     paths["energy"] = os.path.basename(energy_path)
 
-    # Zone temp vs comfort band
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(ai.index, ai["zone_temp_c"], label="AI zone temp", color="tab:orange")
-    ax.axhspan(COMFORT_MIN_C, COMFORT_MAX_C, color="green", alpha=0.15, label="Comfort band")
-    ax.set_xlabel("Step")
-    ax.set_ylabel("Zone temp (C)")
-    ax.set_title("AI-driven zone temperature vs comfort band")
-    ax.legend()
+    # Zone temp vs comfort band.
+    #
+    # The comfort band is drawn ONLY over occupied hours. Drawing it across
+    # the whole day made a passing run look like a failing one: the zone
+    # correctly sits at the 18C setback overnight, which appeared as hours
+    # of "violation" against a band that does not apply when the building
+    # is empty. Occupied periods are shaded so the reader can see which
+    # stretches are actually being judged.
+    hours = ai["step"] * 0.25  # 15-minute steps
+    occ = ai["occupied"].to_numpy()
+    fig, ax = plt.subplots(figsize=(9, 4))
+
+    # Shade each contiguous occupied block, and band only that span.
+    start = None
+    labelled = False
+    for i, is_occ in enumerate(list(occ) + [False]):
+        if is_occ and start is None:
+            start = i
+        elif not is_occ and start is not None:
+            x0, x1 = hours.iloc[start], hours.iloc[i - 1]
+            ax.axvspan(x0, x1, color="tab:blue", alpha=0.07,
+                       label="Occupied" if not labelled else None)
+            ax.add_patch(plt.Rectangle(
+                (x0, COMFORT_MIN_C), x1 - x0, COMFORT_MAX_C - COMFORT_MIN_C,
+                color="green", alpha=0.18, zorder=0,
+                label="Comfort band (applies when occupied)" if not labelled else None))
+            labelled = True
+            start = None
+
+    ax.plot(hours, ai["zone_temp_c"], label="Zone temperature", color="tab:orange", lw=1.6)
+
+    viol = ai[ai["occupied"] & ((ai["zone_temp_c"] < COMFORT_MIN_C)
+                                | (ai["zone_temp_c"] > COMFORT_MAX_C))]
+    if len(viol):
+        ax.scatter(viol["step"] * 0.25, viol["zone_temp_c"], color="red", s=18,
+                   zorder=5, label=f"Violations ({len(viol)})")
+
+    ax.set_xlabel("Hours elapsed")
+    ax.set_ylabel("Zone temperature (°C)")
+    ax.set_title("Comfort held during every occupied hour"
+                 if not len(viol) else "Zone temperature vs comfort band")
+    ax.legend(loc="lower right", fontsize=8)
     fig.tight_layout()
     comfort_path = os.path.join(out_dir, "comfort_band.png")
     fig.savefig(comfort_path)
