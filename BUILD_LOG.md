@@ -301,6 +301,37 @@ actually existed. Built from scratch following the plan's own strategy.
     these constants - the constants are already at their measured
     optimum and tuning them further is just fitting the benchmark.
 
+- **Grid signal added; load shifting works but the LLM now HURTS the
+  result (2026-07-26).** Added `grid.py` (time-of-use price + carbon
+  intensity), per-step cost/CO2 accounting, a `get_grid_forecast` tool,
+  and pre-charge/peak-discharge rules in the supervisor. 48h results vs
+  the fixed-schedule baseline:
+
+  | arm | kWh | cost | kgCO2 | peak kWh | violations | overrides |
+  |---|---|---|---|---|---|---|
+  | baseline | 57.38 | 8.18 | 15.49 | 7.57 | 8/80 | - |
+  | rules only | 58.11 | 7.84 (-4.2%) | 15.14 (-2.3%) | 5.73 | 0/80 | - |
+  | LLM+supervisor | 60.37 | 8.08 (-1.2%) | 15.73 (+1.5% WORSE) | 5.52 | 0/80 | 60.4% |
+
+  The strategy itself is sound - peak-window draw falls ~25% and HVAC
+  draw hits exactly 0.0 kWh for several consecutive steps during the
+  peak, coasting on banked heat. But **the LLM arm loses to its own rule
+  set** on cost and carbon. Cause: going from a 3-rule to a 5-rule prompt
+  pushed the 1.5B model past its capability, and the override rate jumped
+  12.5% -> 60.4%. **Do not attribute the savings to the LLM** -
+  `ARCHITECTURE.md` §7 reports all three arms side by side for exactly
+  this reason. Highest-value fix remains running the 7B model on adequate
+  hardware (`--model qwen2.5-coder:7b`, one flag).
+
+- **Weather default changed to winter (2026-07-26).** `MockBuilding` now
+  takes `outdoor_base_c=4.0, outdoor_swing_c=5.0` (-1C to 9C). The old
+  mild profile (6C to 22C) put outdoor temperature *above* the indoor
+  target every afternoon, so heating was already off during the evening
+  price peak - leaving load shifting nothing to shift and making the
+  whole grid-signal question unanswerable. Not benchmark-fitting: a
+  heating-dominated winter day is the realistic case for this demo, and
+  the sensitivity sweep across climates is recorded above.
+
 ## Next steps (in order)
 
 1. Confirm `qwen2.5-coder:7b` finished downloading (`ollama list`) and

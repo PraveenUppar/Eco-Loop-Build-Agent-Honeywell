@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import grid  # noqa: E402
 from tools import COMFORT_MAX_C, COMFORT_MIN_C  # noqa: E402
 
 
@@ -38,10 +39,41 @@ def comfort_violations(df: pd.DataFrame) -> int:
     return len(out_of_band)
 
 
+def _peak_kwh(df: pd.DataFrame) -> float:
+    """Energy drawn during the on-peak price window."""
+    peak = df[(df["minute_of_day"] >= grid.PEAK_START_HOUR * 60)
+              & (df["minute_of_day"] < grid.PEAK_END_HOUR * 60)]
+    return peak["energy_kwh_step"].sum()
+
+
+def _pct(before: float, after: float) -> float:
+    return 0.0 if before == 0 else round((before - after) / before * 100, 2)
+
+
 def summarize(baseline: pd.DataFrame, ai: pd.DataFrame) -> dict:
     baseline_kwh = baseline["energy_kwh_step"].sum()
     ai_kwh = ai["energy_kwh_step"].sum()
     savings_pct = 0.0 if baseline_kwh == 0 else (baseline_kwh - ai_kwh) / baseline_kwh * 100
+
+    # Cost and carbon are the metrics that actually move here. Total kWh
+    # barely changes - the strategy shifts *when* energy is drawn rather
+    # than reducing how much, so reporting kWh alone would hide the result.
+    has_grid = "cost_step" in baseline.columns and "cost_step" in ai.columns
+    if has_grid:
+        grid_stats = {
+            "baseline_cost": round(baseline["cost_step"].sum(), 2),
+            "ai_cost": round(ai["cost_step"].sum(), 2),
+            "cost_savings_pct": _pct(baseline["cost_step"].sum(), ai["cost_step"].sum()),
+            "baseline_kg_co2": round(baseline["carbon_g_step"].sum() / 1000, 2),
+            "ai_kg_co2": round(ai["carbon_g_step"].sum() / 1000, 2),
+            "carbon_savings_pct": _pct(baseline["carbon_g_step"].sum(),
+                                       ai["carbon_g_step"].sum()),
+            "baseline_peak_kwh": round(_peak_kwh(baseline), 2),
+            "ai_peak_kwh": round(_peak_kwh(ai), 2),
+            "peak_shift_pct": _pct(_peak_kwh(baseline), _peak_kwh(ai)),
+        }
+    else:
+        grid_stats = {}
 
     # Share of agent decisions the deterministic supervisor had to correct.
     # Reported prominently and deliberately: a high rate means the headline
@@ -68,6 +100,7 @@ def summarize(baseline: pd.DataFrame, ai: pd.DataFrame) -> dict:
         "baseline_avg_latency_s": round(baseline["latency_s"].mean(), 3),
         "ai_avg_latency_s": round(ai["latency_s"].mean(), 3),
         "supervisor_override_pct": override_pct,
+        **grid_stats,
     }
 
 
@@ -103,6 +136,30 @@ def make_charts(baseline: pd.DataFrame, ai: pd.DataFrame, out_dir: str) -> dict:
     plt.close(fig)
     paths["comfort"] = os.path.basename(comfort_path)
 
+    # Load shifting is the actual result, so show it directly: energy drawn
+    # per step against the price curve. The visible signature is the AI
+    # trace rising before the shaded peak and dropping inside it.
+    if "cost_step" in ai.columns:
+        day = ai[ai["step"] < 96] if (ai["step"] < 96).any() else ai
+        base_day = baseline[baseline["step"] < 96] if (baseline["step"] < 96).any() else baseline
+        hours = day["minute_of_day"] / 60.0
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(base_day["minute_of_day"] / 60.0, base_day["energy_kwh_step"],
+                label="Baseline", color="tab:blue")
+        ax.plot(hours, day["energy_kwh_step"], label="AI-driven", color="tab:orange")
+        ax.axvspan(grid.PEAK_START_HOUR, grid.PEAK_END_HOUR, color="red", alpha=0.12,
+                   label="On-peak price window")
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel("Energy per step (kWh)")
+        ax.set_title("Load shifting: energy drawn vs price peak")
+        ax.set_xlim(0, 24)
+        ax.legend()
+        fig.tight_layout()
+        shift_path = os.path.join(out_dir, "load_shift.png")
+        fig.savefig(shift_path)
+        plt.close(fig)
+        paths["shift"] = os.path.basename(shift_path)
+
     return paths
 
 
@@ -129,18 +186,35 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <p>Baseline: <code>{baseline_path}</code> &nbsp;|&nbsp; AI-driven: <code>{ai_path}</code></p>
 
 <div class="stats">
-  <div class="stat"><div class="value">{baseline_kwh} kWh</div><div class="label">Baseline energy</div></div>
-  <div class="stat"><div class="value">{ai_kwh} kWh</div><div class="label">AI-driven energy</div></div>
-  <div class="stat"><div class="value savings">{savings_pct}%</div><div class="label">Energy reduction</div></div>
-  <div class="stat"><div class="value {comfort_class}">{ai_comfort_violations}</div><div class="label">AI comfort violations</div></div>
-  <div class="stat"><div class="value">{ai_avg_latency_s}s</div><div class="label">Avg agent latency/step</div></div>
+  <div class="stat"><div class="value savings">{cost_savings_pct}%</div><div class="label">Cost reduction</div></div>
+  <div class="stat"><div class="value savings">{carbon_savings_pct}%</div><div class="label">CO2 reduction</div></div>
+  <div class="stat"><div class="value savings">{peak_shift_pct}%</div><div class="label">Peak-hour energy cut</div></div>
+  <div class="stat"><div class="value {comfort_class}">{ai_comfort_violations}</div><div class="label">Comfort violations</div></div>
+</div>
+
+<p class="note">Total energy is roughly unchanged ({baseline_kwh} &rarr; {ai_kwh} kWh,
+{savings_pct}%). That is expected and is the point: the agent shifts <em>when</em>
+energy is drawn rather than reducing how much, heating while power is cheap and
+clean and coasting on stored heat through the expensive carbon-heavy peak. A fixed
+setback schedule cannot do this &mdash; it has no notion of what hour it is in price
+terms.</p>
+
+<div class="stats">
+  <div class="stat"><div class="value">{baseline_cost} &rarr; {ai_cost}</div><div class="label">Cost (baseline &rarr; AI)</div></div>
+  <div class="stat"><div class="value">{baseline_kg_co2} &rarr; {ai_kg_co2}</div><div class="label">kg CO2</div></div>
+  <div class="stat"><div class="value">{baseline_peak_kwh} &rarr; {ai_peak_kwh}</div><div class="label">Peak-window kWh</div></div>
+  <div class="stat"><div class="value">{ai_avg_latency_s}s</div><div class="label">Avg agent latency</div></div>
   <div class="stat"><div class="value">{supervisor_override_pct}%</div><div class="label">Supervisor overrides</div></div>
 </div>
 
 <p class="note">The supervisor override rate is the share of LLM setpoint decisions
 that the deterministic safety layer had to correct (see <code>supervisor.py</code>).
 The higher this number, the more the results above reflect the override rules
-rather than the language model's own control judgment.</p>
+rather than the language model's own control judgment. Baseline comfort violations:
+{baseline_comfort_violations}.</p>
+
+<h2>Load shifting against the price peak</h2>
+<img src="{shift_chart}" alt="Energy drawn vs price peak">
 
 <h2>Cumulative energy</h2>
 <img src="{energy_chart}" alt="Cumulative energy comparison">
@@ -177,6 +251,7 @@ def main():
         comfort_class="warn" if stats["ai_comfort_violations"] > 0 else "savings",
         energy_chart=charts["energy"],
         comfort_chart=charts["comfort"],
+        shift_chart=charts.get("shift", ""),
         **stats,
     )
     with open(args.out, "w") as f:

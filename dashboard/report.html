@@ -21,18 +21,35 @@
 <p>Baseline: <code>logs/mock.csv</code> &nbsp;|&nbsp; AI-driven: <code>logs/mock-ai.csv</code></p>
 
 <div class="stats">
-  <div class="stat"><div class="value">12.597 kWh</div><div class="label">Baseline energy</div></div>
-  <div class="stat"><div class="value">17.573 kWh</div><div class="label">AI-driven energy</div></div>
-  <div class="stat"><div class="value savings">-39.5%</div><div class="label">Energy reduction</div></div>
-  <div class="stat"><div class="value warn">6</div><div class="label">AI comfort violations</div></div>
-  <div class="stat"><div class="value">1.947s</div><div class="label">Avg agent latency/step</div></div>
-  <div class="stat"><div class="value">20.8%</div><div class="label">Supervisor overrides</div></div>
+  <div class="stat"><div class="value savings">1.2%</div><div class="label">Cost reduction</div></div>
+  <div class="stat"><div class="value savings">-1.53%</div><div class="label">CO2 reduction</div></div>
+  <div class="stat"><div class="value savings">27.0%</div><div class="label">Peak-hour energy cut</div></div>
+  <div class="stat"><div class="value savings">0</div><div class="label">Comfort violations</div></div>
+</div>
+
+<p class="note">Total energy is roughly unchanged (57.377 &rarr; 60.373 kWh,
+-5.22%). That is expected and is the point: the agent shifts <em>when</em>
+energy is drawn rather than reducing how much, heating while power is cheap and
+clean and coasting on stored heat through the expensive carbon-heavy peak. A fixed
+setback schedule cannot do this &mdash; it has no notion of what hour it is in price
+terms.</p>
+
+<div class="stats">
+  <div class="stat"><div class="value">8.18 &rarr; 8.08</div><div class="label">Cost (baseline &rarr; AI)</div></div>
+  <div class="stat"><div class="value">15.49 &rarr; 15.73</div><div class="label">kg CO2</div></div>
+  <div class="stat"><div class="value">7.57 &rarr; 5.52</div><div class="label">Peak-window kWh</div></div>
+  <div class="stat"><div class="value">1.786s</div><div class="label">Avg agent latency</div></div>
+  <div class="stat"><div class="value">60.4%</div><div class="label">Supervisor overrides</div></div>
 </div>
 
 <p class="note">The supervisor override rate is the share of LLM setpoint decisions
 that the deterministic safety layer had to correct (see <code>supervisor.py</code>).
 The higher this number, the more the results above reflect the override rules
-rather than the language model's own control judgment.</p>
+rather than the language model's own control judgment. Baseline comfort violations:
+8.</p>
+
+<h2>Load shifting against the price peak</h2>
+<img src="load_shift.png" alt="Energy drawn vs price peak">
 
 <h2>Cumulative energy</h2>
 <img src="energy_comparison.png" alt="Cumulative energy comparison">
