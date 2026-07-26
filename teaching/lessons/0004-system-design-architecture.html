@@ -1,0 +1,108 @@
+<title>4 · System Design & Architecture</title>
+<link rel="stylesheet" href="../assets/style.css">
+<span class="kicker">Eco-Loop · Lesson 4 of 10</span>
+<h1>System design and architecture</h1>
+<p class="dek">Four things an interviewer will want you to draw from memory:
+the process boundary, how data crosses it safely, the callback model inside
+EnergyPlus, and the defense-in-depth safety stack. This lesson is the one to
+re-read right before the interview.</p>
+
+<h2>The full component diagram</h2>
+<div class="flow vertical">
+  <div class="flow-box accent"><span class="t">EnergyPlus process (in-process Python API)</span>
+    <span class="s">Runs the physics. Two callbacks hook into it: one to actuate, one to sense+decide (see below). Holds the safety clamp and operating envelope.</span></div>
+  <div class="flow-arrow">↕ atomic JSON files: runtime_state.json (sim→tools), pending_policy.json (tools→sim)</div>
+  <div class="flow-box accent"><span class="t">MCP server process (separate, stdio)</span>
+    <span class="s">Exposes 5 tools: get_building_state, get_energy_summary, set_setpoints, read_simulation_errors, list_zones. Cannot see the sim's Python objects, so it only ever talks through those two files.</span></div>
+  <div class="flow-arrow">↕ MCP protocol calls, via a background-thread event loop (mcp_bridge.py)</div>
+  <div class="flow-box"><span class="t">Agent supervisor (agent.py)</span>
+    <span class="s">Builds the prompt, calls the model, applies self-correction, tracks the decision cache.</span></div>
+  <div class="flow-arrow">↕ chat request/response</div>
+  <div class="flow-box"><span class="t">Ollama (local LLM server)</span>
+    <span class="s">Runs qwen2.5:3b-instruct, returns schema-constrained JSON.</span></div>
+</div>
+
+<h2>Why the callback model, and why two callbacks not one</h2>
+<p>EnergyPlus's Python API lets you register functions that fire at specific
+points in its simulation loop. This project uses exactly two:</p>
+<table>
+  <tr><th>Callback</th><th>Job</th><th>Why this one</th></tr>
+  <tr><td class="mono">begin_system_timestep_<br>before_predictor</td><td><strong>Actuate</strong></td>
+    <td>Fires before the zone predictor computes heating/cooling loads, so a setpoint written here actually affects this timestep. Any later and it'd be a timestep too late.</td></tr>
+  <tr><td class="mono">end_zone_timestep_<br>after_zone_reporting</td><td><strong>Sense + decide</strong></td>
+    <td>Fires exactly once per zone timestep. EnergyPlus can internally shorten the <em>system</em> timestep during difficult HVAC iterations — reading energy meters in the actuation callback would double-count. This callback is the one guaranteed once-per-zone-timestep hook.</td></tr>
+</table>
+<p>A controller (baseline / rule-based / agent) never touches an actuator
+directly — it only returns a <code>Policy</code> object; the runner clamps
+and applies it. That indirection is what makes the safety layer
+non-optional: there's no code path that skips it.</p>
+
+<h2>Crossing the process boundary safely</h2>
+<p>The MCP server is a <strong>separate</strong> process from the simulation
+— it can't import the simulation's Python objects, so the two talk through
+two small JSON files, written with <code>os.replace</code> (atomic on NTFS —
+a reader can never observe a half-written file).</p>
+<div class="callout warn">
+  <span class="label">A real bug, worth knowing about</span>
+  On Windows, <code>os.replace</code> raises <code>WinError 5</code> if the
+  destination file happens to be open in another process at that instant.
+  With the MCP server polling state while the simulation writes it 2,016
+  times, this fired constantly in early testing. Fix: a short bounded retry
+  on both sides, treating the state file as <em>telemetry</em> — a dropped
+  write is fine, because the next timestep republishes a fresh one 15 minutes
+  later. Killing the simulation over a missed write would have been the wrong
+  trade.
+</div>
+
+<h2>Calling an async tool from a synchronous callback</h2>
+<p>The EnergyPlus callback is an ordinary synchronous Python function. The
+MCP client session, however, is <strong>asyncio-based</strong> and needs to
+stay open for the entire run. <code>mcp_bridge.py</code> resolves this by
+running the whole async session on its own event loop in a background
+thread, and the callback submits work to it with
+<code>run_coroutine_threadsafe</code>. This is what lets the agent talk to a
+<em>real</em> MCP server over stdio, rather than the easier shortcut of just
+importing the tool functions and calling them directly in-process.</p>
+
+<h2>The safety stack (defense in depth)</h2>
+<p>Nothing reaches a real actuator without passing through all of this,
+regardless of where the policy came from:</p>
+<div class="flow vertical">
+  <div class="flow-box"><span class="t">clamp_pair()</span><span class="s">Hard numeric bounds: heating 18–22 °C, cooling 23–27 °C, deadband ≥ 1.5 °C. Non-numeric, NaN, inf, booleans, and inverted pairs all resolve to a safe fallback — nothing crashes, nothing passes through unclamped.</span></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-box accent"><span class="t">set_setpoints tool check</span><span class="s">Context-aware: OCCUPIED rejects cooling above 25 °C; EMPTY rejects cooling below 26 °C (that would run the AC for nobody). Rejections carry the specific reason — this is what drives self-correction.</span></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-box"><span class="t">operating_envelope()</span><span class="s">Runs every 15-minute timestep, independent of what the supervisor asked 4 hours ago. Pulls setpoints into the comfort band if occupied; pushes them to setback if empty.</span></div>
+</div>
+<p>The third layer is the one that's easy to underrate: the supervisor only
+re-plans every 4 hours, so without an independent per-timestep guard, a
+setback policy chosen at 04:00 (nobody home) would still be legally "in
+force" — and silently applied — at 06:00 when people start arriving.</p>
+
+<h2>Config as the single source of truth</h2>
+<p><code>src/config.py</code> is the one file every other module imports from
+for zone names, schedule names, safety limits, and the run period. That's a
+deliberate architectural choice: the runner, the MCP server, the agent's
+prompt, and the dashboard all need to agree on, say, what "occupied" means —
+having one file own that avoids the classic bug of four places disagreeing
+about a limit after only three get updated.</p>
+
+<details class="quiz">
+  <summary>Quick check: if the operating envelope already re-guards every timestep, why does the MCP tool layer also need to reject unsafe requests?</summary>
+  <div class="answer">Because the tool-layer rejection is what feeds
+  self-correction — it hands the model a specific, actionable reason it can
+  react to on retry. The operating envelope alone would silently override an
+  unsafe policy without ever telling the model it was wrong, so the model
+  would keep proposing the same mistake every cycle instead of learning
+  within the conversation.</div>
+</details>
+
+<div class="ask-agent">Ask me to trace one specific piece of data — say, an
+outdoor temperature reading — all the way from the EnergyPlus callback to the
+LLM's prompt. Following one value through every hop cements this diagram
+faster than re-reading it.</div>
+
+<div class="nav">
+  <a href="0003-the-workflow.html">← Lesson 3</a>
+  <a href="0005-key-decisions.html">Lesson 5 → Key Decisions</a>
+</div>

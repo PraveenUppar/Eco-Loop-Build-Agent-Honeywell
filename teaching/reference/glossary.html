@@ -1,0 +1,86 @@
+<title>Glossary — Eco-Loop</title>
+<link rel="stylesheet" href="../assets/style.css">
+<span class="kicker">Eco-Loop · Reference</span>
+<h1>Glossary</h1>
+<p class="dek">Every term used across the 10 lessons, in one place, grouped by
+category. Designed to print or scan quickly before the interview — not to
+read start to finish.</p>
+
+<h2>Building control fundamentals</h2>
+<table>
+  <tr><td class="mono">setpoint</td><td>A threshold temperature, not a target — equipment switches on when the room crosses it. This project has two: <code>heating_c</code> and <code>cooling_c</code>. See Lesson 1.</td></tr>
+  <tr><td class="mono">deadband</td><td>The gap between heating_c and cooling_c. Nothing runs while the room is inside it — a wider deadband means less electricity spent.</td></tr>
+  <tr><td class="mono">HVAC</td><td>Heating, Ventilation, and Air Conditioning — the building systems this project's setpoints control.</td></tr>
+  <tr><td class="mono">VAV</td><td>Variable Air Volume — an HVAC system type that varies how much conditioned air it delivers, rather than always delivering a fixed amount. The building in this project is VAV with reheat.</td></tr>
+  <tr><td class="mono">zone</td><td>One controllable region of a building with its own temperature sensor and setpoint. This project has 5 conditioned zones plus 1 excluded plenum.</td></tr>
+  <tr><td class="mono">plenum</td><td>An unconditioned space (here, a return-air plenum) with no thermostat control and no occupants — excluded from both control and the comfort metric.</td></tr>
+  <tr><td class="mono">occupancy schedule</td><td>Data describing when a zone is expected to have people in it — drives which comfort/safety rules apply at any given moment.</td></tr>
+  <tr><td class="mono">comfort band</td><td>20–25 °C in this project — the range occupied zones must stay within. Violations are measured only during occupied hours.</td></tr>
+  <tr><td class="mono">setback</td><td>Deliberately widening setpoints during unoccupied hours (here, heating ≤19 °C / cooling ≥26 °C) since nobody can be uncomfortable, so any equipment running is pure waste.</td></tr>
+  <tr><td class="mono">PMV</td><td>Predicted Mean Vote — the standard (ASHRAE 55) thermal-comfort model accounting for humidity, air speed, clothing, and metabolic rate, not just air temperature. This project uses a simpler temperature-band metric instead (Lesson 9).</td></tr>
+  <tr><td class="mono">BMS</td><td>Building Management System — the real-world class of software this project's supervisory/inner-loop split is modeled on.</td></tr>
+  <tr><td class="mono">demand (kW) vs. energy (kWh)</td><td>kWh is total electricity consumed over a period; kW (demand) is the instantaneous rate — peak kW matters separately because utilities often charge for it directly.</td></tr>
+</table>
+
+<h2>EnergyPlus specifics</h2>
+<table>
+  <tr><td class="mono">EnergyPlus</td><td>The whole-building physics simulation engine this project runs, in-process, via its Python API.</td></tr>
+  <tr><td class="mono">IDF</td><td>Input Data File — EnergyPlus's native plain-text building description format (geometry, zones, schedules, systems).</td></tr>
+  <tr><td class="mono">EPW / TMY3</td><td>EnergyPlus Weather file format; TMY3 ("Typical Meteorological Year") is a real-location weather dataset used to drive the simulation — Chicago, here.</td></tr>
+  <tr><td class="mono">Schedule:Compact</td><td>The IDF object type used for the heating/cooling setpoint schedules — actuating it overrides its value for that timestep.</td></tr>
+  <tr><td class="mono">callback</td><td>A Python function registered with the EnergyPlus API that fires automatically at a specific point in the simulation loop. This project uses two — see Lesson 4.</td></tr>
+  <tr><td class="mono">handle</td><td>An integer reference EnergyPlus hands back for a named variable/meter/actuator, resolved once and reused every timestep for fast lookups.</td></tr>
+  <tr><td class="mono">actuator</td><td>A handle that can be <em>written to</em>, not just read — this project actuates the heating and cooling schedule values.</td></tr>
+  <tr><td class="mono">meter</td><td>An EnergyPlus energy-accounting handle (e.g. <code>Cooling:Electricity</code>) summed over time to get kWh.</td></tr>
+  <tr><td class="mono">timestep</td><td>The simulation's control resolution — 15 minutes here (4 per hour), 2,016 total across the 3-week run.</td></tr>
+  <tr><td class="mono">warmup / sizing / design day</td><td>Simulation phases EnergyPlus runs before and around the actual reporting period, explicitly filtered out by a run-period guard so they never contaminate results.</td></tr>
+</table>
+
+<h2>AI / LLM / agent concepts</h2>
+<table>
+  <tr><td class="mono">LLM</td><td>Large Language Model — software that generates text (here, JSON) from a prompt. This project uses <code>qwen2.5:3b-instruct</code>, run locally via Ollama.</td></tr>
+  <tr><td class="mono">parameters (3B)</td><td>A rough size measure for a model — "3B" ≈ 3 billion learned numeric weights. Smaller models are cheaper/faster to run locally but less reliable, which is why this project's validation layer exists.</td></tr>
+  <tr><td class="mono">instruction-tuned</td><td>A model specifically trained to follow prompts/instructions (vs. just continuing arbitrary text) — the "-instruct" in the model name.</td></tr>
+  <tr><td class="mono">system prompt / user prompt</td><td>The system prompt sets standing context and rules for the whole conversation (here: what a setpoint is, the hard limits); the user prompt carries the per-call situational data (current readings, allowed range, recent history).</td></tr>
+  <tr><td class="mono">temperature (sampling)</td><td>A model-output-randomness setting; this project uses 0.2 (low) for more deterministic, repeatable decisions.</td></tr>
+  <tr><td class="mono">structured output / JSON schema</td><td>Constraining a model's raw output to match a specific JSON shape, passed via Ollama's <code>format</code> parameter — different from tool calling (see below). See Lesson 5 and 8.</td></tr>
+  <tr><td class="mono">tool calling / function calling</td><td>Letting a model (or the code orchestrating it) invoke defined external functions with typed arguments — here, the 5 MCP tools.</td></tr>
+  <tr><td class="mono">agent / agentic loop</td><td>Software that reads state, decides, acts, and observes the result, repeatedly. "Agent supervisor" in this project cycles: sense → tool calls → prompt → validate → act.</td></tr>
+  <tr><td class="mono">supervisory control</td><td>The AI sets slow-changing policy (every 4h); a separate deterministic loop applies and enforces it continuously (every 15 min). See Lesson 2.</td></tr>
+  <tr><td class="mono">self-correction</td><td>Feeding a rejected attempt's specific failure reason back to the model and letting it retry, rather than giving up or silently overriding it.</td></tr>
+  <tr><td class="mono">fallback</td><td>The safe default (here, the rule-based controller's target) used when the model produces nothing usable after retries — the building is never left without a policy.</td></tr>
+  <tr><td class="mono">decision cache</td><td>Reusing a past decision for a "bucketed" (rounded, near-identical) situation instead of calling the model again.</td></tr>
+  <tr><td class="mono">latency</td><td>Time from asking the model to getting a reply — 3.27s median here, the reason for supervisory rather than per-timestep cadence.</td></tr>
+  <tr><td class="mono">token</td><td>A chunk of text an LLM processes cost/length in — this project budgets ~1,000 tokens per decision.</td></tr>
+</table>
+
+<h2>MCP and systems concepts</h2>
+<table>
+  <tr><td class="mono">MCP</td><td>Model Context Protocol — a standard for exposing tools to an AI client over a defined protocol. See Lesson 8.</td></tr>
+  <tr><td class="mono">MCP server / client</td><td>The server exposes tools (here: 5, in <code>mcp_server.py</code>); the client (the agent) calls them and reads results.</td></tr>
+  <tr><td class="mono">stdio transport</td><td>Client and server communicate over the server subprocess's standard input/output streams — no network port involved.</td></tr>
+  <tr><td class="mono">FastMCP</td><td>A decorator-based framework (<code>@mcp.tool()</code>) for building an MCP server with minimal boilerplate.</td></tr>
+  <tr><td class="mono">asyncio / event loop</td><td>Python's built-in framework for concurrent I/O-bound code; the MCP client session runs on its own event loop in a background thread here, because it must stay open for the whole run while the EnergyPlus callback stays synchronous.</td></tr>
+  <tr><td class="mono">run_coroutine_threadsafe</td><td>The specific asyncio function used to submit work from the synchronous callback thread to the background event loop thread.</td></tr>
+  <tr><td class="mono">atomic write</td><td>A file write that a reader can never observe half-finished — done here via write-to-temp-file then <code>os.replace</code>, which is atomic on NTFS.</td></tr>
+  <tr><td class="mono">race condition</td><td>A bug caused by two processes/threads touching shared state at an unpredictable relative time — the motivation for atomic writes and the bounded-retry fix around Windows' <code>WinError 5</code>.</td></tr>
+  <tr><td class="mono">defense in depth</td><td>Stacking multiple independent safety checks so no single failure point can let something unsafe through — the clamp → tool check → operating envelope stack (Lesson 4).</td></tr>
+</table>
+
+<h2>Project-specific shorthand</h2>
+<table>
+  <tr><td class="mono">Policy</td><td>The dataclass carrying a heating/cooling setpoint pair plus its source and reason — the one object every controller returns.</td></tr>
+  <tr><td class="mono">clamp</td><td>Forcing a value into a safe numeric range, regardless of where it came from.</td></tr>
+  <tr><td class="mono">operating envelope</td><td>The per-timestep, occupancy-aware re-guard that runs independently of the 4-hourly supervisor decision.</td></tr>
+  <tr><td class="mono">baseline / rule-based / agent</td><td>The three controller modes compared head-to-head — see Lesson 10.</td></tr>
+  <tr><td class="mono">median-per-bucket export</td><td>How <code>agent_optimized.idf</code> is built: median applied setpoint per (day-type, hour), discarding outlier decisions.</td></tr>
+  <tr><td class="mono">endurance run</td><td>The season-long (June–August) rerun used to check nothing degrades over a longer horizon than the reported 3-week experiment.</td></tr>
+</table>
+
+<div class="ask-agent">Missing a term you ran into elsewhere in the repo?
+Ask me and I'll add it here.</div>
+
+<div class="nav">
+  <a href="../lessons/0010-three-controllers-compared.html">← Back to Lesson 10</a>
+  <a href="../lessons/0001-the-problem.html">Lesson 1 →</a>
+</div>

@@ -1,0 +1,102 @@
+<title>1 · The Problem</title>
+<link rel="stylesheet" href="../assets/style.css">
+<span class="kicker">Eco-Loop · Lesson 1 of 10</span>
+<h1>The problem: buildings are climate-controlled by guesswork frozen in time</h1>
+<p class="dek">Start here with zero assumptions. By the end you'll know what a
+"setpoint" and a "deadband" actually are, and why that 1.7&nbsp;°C gap in this
+project's baseline building is the whole reason there's anything to save.</p>
+
+<h2>What a thermostat actually does</h2>
+<p>A room has <strong>two</strong> numbers controlling it, not one:</p>
+<div class="flow">
+  <div class="flow-box accent"><span class="t">heating_c</span><span class="s">below this, the heater switches ON</span></div>
+  <div class="flow-box accent"><span class="t">cooling_c</span><span class="s">above this, the AC switches ON</span></div>
+</div>
+<p>Between those two numbers is the <strong>deadband</strong>. Inside it,
+<em>nothing runs</em> — the room just floats wherever the weather and the
+people in it put it, and that costs zero electricity. Equipment only turns on
+when the room crosses one of the two thresholds.</p>
+
+<div class="callout">
+  <span class="label">First-principles takeaway</span>
+  A setpoint is a <strong>threshold</strong>, not a "target temperature you're
+  trying to hit." Confusing the two is the single biggest misconception this
+  whole project has to correct — you'll see it again in Lesson&nbsp;5, because
+  it's exactly the mistake the AI model made in an early version.
+</div>
+
+<h2>Why the deadband width is the whole game</h2>
+<p>A <strong>narrow</strong> deadband forces the heater and AC to fight to
+hold a tight band — expensive, and in bad cases they can work against each
+other. A <strong>wide</strong> deadband means the room floats free for longer
+before anything switches on — cheap. So: the wider you can make the deadband
+without making anyone uncomfortable, the less electricity you use. That's the
+entire optimization problem, stated in one sentence.</p>
+
+<h2>The actual building in this project</h2>
+<p>This isn't a toy model. It's <code>5ZoneAirCooled</code>, a standard
+example building shipped with <strong>EnergyPlus</strong> (the industry-grade
+building physics simulator this project runs on) — five conditioned office
+zones plus one unconditioned return plenum, VAV (variable-air-volume) system
+with reheat, simulated against <strong>real Chicago summer weather</strong>
+(TMY3 — a "typical meteorological year" weather file), 1–21 July.</p>
+
+<table>
+  <tr><th>Setting</th><th>Value</th></tr>
+  <tr><td>Zones under control</td><td class="mono">SPACE1-1 … SPACE5-1 (5 zones)</td></tr>
+  <tr><td>Excluded</td><td class="mono">PLENUM-1 — unconditioned, nobody's ever in it</td></tr>
+  <tr><td>Climate</td><td>Chicago, TMY3 weather file</td></tr>
+  <tr><td>Run period</td><td>1–21 July (3 weeks, cooling season)</td></tr>
+  <tr><td>Control resolution</td><td>every 15 simulated minutes (2,016 timesteps total)</td></tr>
+</table>
+
+<p>The building's factory-default schedule holds an occupied deadband of just
+<strong>22.2–23.9&nbsp;°C — only 1.7&nbsp;°C wide</strong>. That's the
+"guesswork frozen in time" in this lesson's title: someone set that schedule
+once, and it now runs forever, blind to today's weather and blind to whether
+anyone is actually in the room right now. That narrowness is deliberate on
+the project's part, too — it's what leaves room to demonstrate savings.</p>
+
+<h2>The actual objective</h2>
+<div class="stats">
+  <div class="stat"><span class="n">↓ kWh</span><span class="l">use less electricity</span></div>
+  <div class="stat"><span class="n">= comfort</span><span class="l">without pushing occupied zones outside 20–25 °C</span></div>
+</div>
+<p>Comfort is measured as the share of <strong>occupied</strong> zone-readings
+that fall outside 20–25&nbsp;°C. Two things worth noticing already: comfort
+only matters when someone is present (the empty-building hours are free real
+estate for savings), and this is a hold-both-at-once problem — you're not
+allowed to trade comfort for savings, you have to find savings that don't
+cost any comfort at all.</p>
+
+<h2>Why this needs to reason, not just execute a schedule</h2>
+<p>A fixed schedule can't answer any of these questions, every single day:</p>
+<ul>
+  <li>Is it a mild day or a scorcher? A wide deadband is free on a mild day
+    and risky on a hot one.</li>
+  <li>Is the building actually occupied right now, or did everyone leave
+    early?</li>
+  <li>What's the cheapest way to prepare for the next few hours given what
+    just happened?</li>
+</ul>
+<p>Answering those well, continuously, is a <strong>control problem</strong> —
+and this project's core idea (Lesson&nbsp;2) is to put a small AI model in
+charge of answering it, instead of a fixed schedule or a human revisiting it
+occasionally.</p>
+
+<details class="quiz">
+  <summary>Quick check: why does comfort only get measured during occupied hours?</summary>
+  <div class="answer">Because nobody can be made uncomfortable in an empty
+  room — so restricting the equipment there would only waste electricity for
+  no benefit. Unoccupied hours are exactly where the biggest, safest
+  savings live, because the comfort constraint doesn't apply.</div>
+</details>
+
+<div class="ask-agent">Stuck on anything above, or want a real-world analogy
+for setpoints/deadbands? Ask me — I'm your teacher for this, not just the
+author of these pages.</div>
+
+<div class="nav">
+  <span>Start</span>
+  <a href="0002-the-approach.html">Lesson 2 → The Approach</a>
+</div>

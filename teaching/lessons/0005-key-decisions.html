@@ -1,0 +1,117 @@
+<title>5 · Key Decisions</title>
+<link rel="stylesheet" href="../assets/style.css">
+<span class="kicker">Eco-Loop · Lesson 5 of 10</span>
+<h1>Decisions made, and why</h1>
+<p class="dek">Every one of these is a real fork in the road where a simpler,
+worse option was available and rejected on purpose. Interviewers probe
+exactly this list — "why didn't you just—" — so each entry below states the
+alternative that was passed over.</p>
+
+<h2>The prompt taught the mechanism, not a rulebook — because rules didn't generalize</h2>
+<p>This is the single best story in the project, worth telling in full.</p>
+<div class="callout bad">
+  <span class="label">What went wrong first</span>
+  The first system prompt just listed instructions: "raise cooling_c to save
+  energy." On hot days the model chose <strong>cooling_c 23.5&nbsp;°C — the
+  most expensive legal option</strong> — reasoning that since it was hot
+  outside, more cooling was needed. That's backwards: cooling_c is a
+  threshold, and lowering it makes the AC start <em>earlier</em>, not "cool
+  harder for free."
+</div>
+<p>The failure was diagnosable precisely because it was a <strong>conceptual</strong>
+error, not an instruction-following error — the model wasn't ignoring the
+rule, it was pattern-matching "hot → cool harder" without understanding what
+the number it was setting actually controlled. The fix was rewriting the
+prompt to explain the <em>mechanism</em>: what a setpoint is, what the
+deadband is, why raising cooling_c saves energy, and naming the specific
+misconception directly. A model that understands the mechanism generalizes to
+situations no rulebook enumerated; a model following memorized rules doesn't.</p>
+
+<h2>Structured output (JSON schema) instead of parsing prose</h2>
+<table>
+  <tr><th>Decision</th><td>Ollama is given an explicit JSON schema via the <code>format</code> parameter, not just <code>format: "json"</code> or free text.</td></tr>
+  <tr><th>Why</th><td>Reliability on a small model can't come from "asking politely." A schema constraint does more for it than any prompt wording — the measured result across every reported run is <strong>0 malformed JSON responses</strong>.</td></tr>
+  <tr><th>Alternative rejected</th><td>Parsing free-text replies with regex — fragile against a 3B model's inconsistent phrasing.</td></tr>
+</table>
+
+<h2>History as a fixed 6-row table, not a growing transcript</h2>
+<table>
+  <tr><th>Decision</th><td>The model sees only its last 6 decisions, as a compact table (time, setpoints, cumulative kWh, mean zone temp) — not a running conversation log.</td></tr>
+  <tr><th>Why</th><td>Prompt cost stays <strong>bounded regardless of run length</strong> (~1,000 tokens per decision, budget target 1,500), while the trend information the model actually needs stays visible.</td></tr>
+  <tr><th>Alternative rejected</th><td>Passing the full conversation transcript — cost would grow unboundedly over a long run.</td></tr>
+</table>
+
+<h2>The legal range restated on every single call</h2>
+<table>
+  <tr><th>Decision</th><td>Every prompt repeats the currently-binding constraint: e.g. <em>"ALLOWED NOW (people present): heating_c 20.0–22.0, cooling_c 23.0–25.0."</em></td></tr>
+  <tr><th>Why</th><td>The occupied comfort limit is the constraint a small model violates most often. Stating it fresh in the user turn — where a small model weights instructions most — cut tool rejections sharply.</td></tr>
+  <tr><th>Alternative rejected</th><td>Stating limits once in the system prompt and trusting the model to remember them across a multi-hour conversation.</td></tr>
+</table>
+
+<h2>Self-correction via real tool rejection, not silent clamping</h2>
+<table>
+  <tr><th>Decision</th><td>When <code>set_setpoints</code> rejects a policy, the <em>specific</em> reason is appended to the conversation and the model gets up to 2 retries.</td></tr>
+  <tr><th>Why</th><td>A specific, actionable error ("cooling_c 27.0 exceeds the comfort limit 25.0") gives the model something to fix. Result: 17 rejections in the reported run, <strong>16</strong> recovered by self-correction.</td></tr>
+  <tr><th>Alternative rejected</th><td>Silently clamping bad values without telling the model — cheaper, but the model would keep proposing the same mistake every cycle, and you'd lose the diagnostic signal entirely.</td></tr>
+</table>
+
+<h2>A bucketed decision cache</h2>
+<table>
+  <tr><th>Decision</th><td>Cache key = <code>(hour // 4, occupied, round(outdoor_temp), round(mean_zone_temp))</code> — a rounded, bucketed situation, not exact state.</td></tr>
+  <tr><th>Why</th><td>02:00 on two consecutive empty weeknights at the same outdoor temperature <em>is</em> the same decision. Rounding is what makes the cache hit at all — exact float state never repeats. Result: 31.7% hit rate over 3 weeks, rising to <strong>59.8%</strong> over a full season (more repeats to find as the horizon grows).</td></tr>
+  <tr><th>Alternative rejected</th><td>Exact-match caching on raw sensor values — would essentially never hit.</td></tr>
+</table>
+
+<h2>Guaranteed fallback, never "no policy"</h2>
+<table>
+  <tr><th>Decision</th><td>If the model still can't produce a usable policy after retries, the rule-based controller's target takes that interval — the building is <em>never</em> left without an active policy.</td></tr>
+  <tr><th>Why</th><td>A control system that can silently do nothing is worse than one that falls back to a known-decent default. Measured: 1 fallback in 126 decisions (3-week run), 5 in 552 (season-long endurance run) — under 1% either way.</td></tr>
+</table>
+
+<h2>Exporting the median policy per (day-type, hour) bucket</h2>
+<table>
+  <tr><th>Decision</th><td><code>export_idf.py</code> doesn't replay the agent's exact per-timestep decisions — it takes the <strong>median</strong> applied setpoint for each (weekday/weekend, hour) bucket and bakes that into a standalone schedule.</td></tr>
+  <tr><th>Why</th><td>The median discards a 3B model's occasional outlier decision. This is exactly why the exported IDF <em>beats</em> the live agent (3.79% vs 3.32% savings, both at 0% comfort violations) — that gap is the model's run-to-run inconsistency, quantified and then filtered out.</td></tr>
+</table>
+
+<h2>A real MCP subprocess, not a direct function call</h2>
+<table>
+  <tr><th>Decision</th><td>The agent talks to the tools over an actual MCP client/server connection across two processes (stdio transport), via a background-thread event loop — not by importing and calling the tool functions in-process.</td></tr>
+  <tr><th>Why</th><td>This is what makes "the agent uses tools" a genuine architectural claim rather than a convenient abstraction — the agent really cannot see or touch the simulation except through the same interface any other MCP client would use.</td></tr>
+</table>
+
+<h2>Quick reference: the full decision list</h2>
+<ul>
+  <li>Supervisory cadence over per-timestep control — Lesson 2</li>
+  <li>Two separate EnergyPlus callbacks (actuate vs. sense) — Lesson 4</li>
+  <li>Teach the mechanism, not a rulebook — above</li>
+  <li>JSON schema over prose parsing — above</li>
+  <li>Fixed 6-row history, not a growing transcript — above</li>
+  <li>Legal range restated per call — above</li>
+  <li>Self-correction from real rejection reasons — above</li>
+  <li>Bucketed decision cache — above</li>
+  <li>Guaranteed rule-based fallback — above</li>
+  <li>Median-per-bucket IDF export — above</li>
+  <li>Real MCP subprocess, not direct import — above</li>
+  <li><code>config.py</code> as single source of truth — Lesson 4</li>
+</ul>
+
+<details class="quiz">
+  <summary>Quick check: what's the common thread across all of these?</summary>
+  <div class="answer">Every one trades a small amount of extra engineering
+  for either reliability on a small model, honest measurement, or graceful
+  degradation. None of them are about making the model "smarter" — they're
+  about making the system work well <em>despite</em> using a small, sometimes
+  wrong, local model. That framing — "the validation layer does real work
+  because the model is 3B" — is the project's central engineering thesis.</div>
+</details>
+
+<div class="ask-agent">Pick any one decision above and ask me to argue the
+<em>other</em> side — why the rejected alternative might actually have been
+fine. Interviewers sometimes push exactly that way to see if you understand
+the trade-off or just memorized the conclusion.</div>
+
+<div class="nav">
+  <a href="0004-system-design-architecture.html">← Lesson 4</a>
+  <a href="0006-repo-map.html">Lesson 6 → Repo Map</a>
+</div>

@@ -1,0 +1,97 @@
+<title>3 · The Workflow</title>
+<link rel="stylesheet" href="../assets/style.css">
+<span class="kicker">Eco-Loop · Lesson 3 of 10</span>
+<h1>The workflow: from one command to a savings report</h1>
+<p class="dek">Two levels here. First the macro pipeline — what happens when
+you run the project end to end. Then the micro cycle — what happens inside
+<em>one</em> supervisory decision, which repeats 126 times per run.</p>
+
+<h2>Macro: one command, five stages</h2>
+<pre><code>python src/prepare_model.py
+python src/run_experiment.py --mode all
+python src/export_idf.py
+python dashboard/build_report.py</code></pre>
+
+<div class="flow vertical">
+  <div class="flow-box accent"><span class="t">1. prepare_model.py</span>
+    <span class="s">Takes the untouched EnergyPlus example file, trims the run period to 3 weeks, strips ~40 unneeded outputs, adds back only the timestep-resolution readings the control loop needs. Writes <code>models/simulation.idf</code>.</span></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-box accent"><span class="t">2. run_experiment.py --mode all</span>
+    <span class="s">Runs the same instrumented model three times, back to back, changing only the controller: baseline (does nothing) → rule-based (hand-written logic) → agent (the LLM supervisor). Each run writes <code>results/&lt;mode&gt;/metrics.json</code> + <code>timeseries.csv</code>.</span></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-box"><span class="t">3. export_idf.py</span>
+    <span class="s">Reads everything the agent actually applied at each of 2,016 timesteps, takes the median setpoint per (weekday/weekend, hour) bucket, and bakes that into a real, standalone EnergyPlus file: <code>models/agent_optimized.idf</code> — runs with no AI, no MCP, no Python at all.</span></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-box"><span class="t">4. build_report.py</span>
+    <span class="s">Reads every mode's results and writes one self-contained HTML dashboard with 5 charts — no server, no network needed to view it.</span></div>
+</div>
+
+<p>Total wall clock: about 6 minutes, almost all of it spent waiting on the
+LLM during the agent run (the physics itself takes 12 seconds — see
+Lesson&nbsp;2's table).</p>
+
+<h2>Micro: what happens inside one supervisory decision</h2>
+<p>This is the cycle that repeats every 4 simulated hours (126 times across
+the 3-week run). It crosses <strong>three separate processes</strong> —
+worth sitting with, because it's the part most worth being able to draw on a
+whiteboard in an interview.</p>
+
+<div class="flow vertical">
+  <div class="flow-box"><span class="t">SENSE</span>
+    <span class="s">EnergyPlus finishes a zone timestep → runner callback reads temperatures, humidity, outdoor weather, occupancy, energy so far → writes it to <code class="mono">runtime_state.json</code> (atomic file write).</span></div>
+  <div class="flow-arrow">↓ every 4h, the agent is due →</div>
+  <div class="flow-box accent"><span class="t">TOOL CALL</span>
+    <span class="s">Agent calls <code class="mono">get_building_state</code> and <code class="mono">get_energy_summary</code> over MCP → the MCP server (a separate process) reads that same JSON file and replies.</span></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-box accent"><span class="t">PROMPT</span>
+    <span class="s">Agent builds a prompt: current readings, the legal setpoint range right now, and the last 6 decisions as a compact table → sends it to Ollama with a JSON schema constraint.</span></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-box"><span class="t">LLM REPLY</span>
+    <span class="s"><code class="mono">qwen2.5:3b-instruct</code> returns <code class="mono">{heating_c, cooling_c, reason}</code> as JSON.</span></div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-box accent"><span class="t">VALIDATE</span>
+    <span class="s">Agent calls the <code class="mono">set_setpoints</code> MCP tool. It clamps the numbers into the safety envelope and — if occupancy makes the request unsafe — <strong>rejects</strong> it with a specific reason instead of silently fixing it.</span></div>
+  <div class="flow-arrow">↓ rejected? → reason is appended to the conversation, model retries (max 2) → still failing? → rule-based controller takes this interval</div>
+  <div class="flow-box"><span class="t">ACT</span>
+    <span class="s">Accepted policy is written to <code class="mono">pending_policy.json</code>. The <em>next</em> 15-minute timestep's inner loop picks it up, re-clamps it against current occupancy (the operating envelope), and writes it to the actual heating/cooling schedule actuators.</span></div>
+</div>
+
+<div class="callout">
+  <span class="label">Worth noticing</span>
+  The validation and the acting happen in <em>different</em> timesteps, by
+  design. The MCP tool validates against the safety envelope once, when the
+  policy is proposed. The inner loop then re-guards it independently on
+  <em>every</em> timestep it's in force — because occupancy can change
+  between now and 4 hours from now, and a setback chosen at 04:00 must not
+  still be in force at 06:00 when people arrive.
+</div>
+
+<h2>Why three processes, not one script</h2>
+<table>
+  <tr><th>Process</th><th>Role</th></tr>
+  <tr><td>EnergyPlus simulation<br><span class="mono">(in the main Python process)</span></td><td>Runs the physics; its callbacks sense and actuate.</td></tr>
+  <tr><td>MCP server<br><span class="mono">(separate subprocess, stdio)</span></td><td>Exposes 5 tools to the agent; cannot see the simulation's Python objects directly, so it reads/writes small JSON files instead.</td></tr>
+  <tr><td>Ollama<br><span class="mono">(local LLM server)</span></td><td>Actually runs the model and returns a JSON reply.</td></tr>
+</table>
+<p>This separation is not incidental complexity — it's what makes the "MCP
+tool layer" a genuine communication bus rather than the agent just calling
+Python functions directly. More on why that matters for the project's
+evaluation criteria in Lesson&nbsp;6.</p>
+
+<details class="quiz">
+  <summary>Quick check: why does SENSE (writing runtime_state.json) happen even on timesteps where no decision is due?</summary>
+  <div class="answer">Because the dashboard, the "vs. baseline so far" comparison,
+  and any tool call the agent makes need up-to-date sensor data at all times —
+  not just at the moment of a decision. Publishing every timestep keeps the
+  state file fresh regardless of the 4-hour decision cadence.</div>
+</details>
+
+<div class="ask-agent">If you want to see this live rather than as a diagram,
+ask me to walk through an actual <code>results/agent/run_log.jsonl</code> or
+<code>llm_calls.jsonl</code> entry from this repo — real data beats a
+description of it.</div>
+
+<div class="nav">
+  <a href="0002-the-approach.html">← Lesson 2</a>
+  <a href="0004-system-design-architecture.html">Lesson 4 → System Design</a>
+</div>

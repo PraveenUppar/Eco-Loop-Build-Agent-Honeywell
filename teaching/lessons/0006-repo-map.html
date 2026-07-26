@@ -1,0 +1,96 @@
+<title>6 · Repo Map</title>
+<link rel="stylesheet" href="../assets/style.css">
+<span class="kicker">Eco-Loop · Lesson 6 of 10</span>
+<h1>Repo map: what every folder and file is for</h1>
+<p class="dek">A guided tour, organized by role rather than alphabetically —
+grouped the way you'd explain it out loud.</p>
+
+<h2>Top-level folders</h2>
+<table>
+  <tr><th>Folder</th><th>Contents</th></tr>
+  <tr><td class="mono">src/</td><td>All the Python: runner, safety layer, MCP server/bridge, agent, metrics, experiment driver, tests.</td></tr>
+  <tr><td class="mono">models/</td><td>The EnergyPlus building files (<code>.idf</code>) — see below.</td></tr>
+  <tr><td class="mono">results/</td><td>Metrics and timeseries written by each experiment run, one subfolder per controller mode, plus <code>results/endurance/</code> for the season-long run.</td></tr>
+  <tr><td class="mono">results_2week/</code>, <td class="mono">results_3week/</td>
+      <td colspan="1">Earlier snapshots of results from different run-length experiments, kept for comparison/audit rather than actively used.</td></tr>
+  <tr><td class="mono">dashboard/</td><td><code>build_report.py</code> (generates the charts) and the generated <code>report.html</code> output.</td></tr>
+  <tr><td class="mono">docs/</td><td>Presentation and demo-video source content — see below.</td></tr>
+  <tr><td class="mono">out/</td><td>Scratch output from individual runs — raw EnergyPlus output files, the shared-state JSON files, API data dumps.</td></tr>
+  <tr><td class="mono">submission/</td><td>The packaged deliverable bundle (built by <code>src/package_submission.py</code>).</td></tr>
+</table>
+
+<h2>src/ — every file, one line each</h2>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td class="mono">config.py</td><td>Single source of truth: zone names, schedule names, safety limits, run period. Everything else imports from here.</td></tr>
+  <tr><td class="mono">prepare_model.py</td><td>Trims the stock example IDF to the run week and instruments it with timestep-resolution outputs.</td></tr>
+  <tr><td class="mono">eplus_runner.py</td><td>The in-process EnergyPlus runner — the two callbacks (sense, actuate), handle resolution, the main run loop.</td></tr>
+  <tr><td class="mono">policy.py</td><td><code>Policy</code> dataclass, <code>clamp_pair</code>/<code>clamp_policy</code>, and <code>operating_envelope</code> — the safety layer.</td></tr>
+  <tr><td class="mono">controllers.py</td><td>Deterministic controllers: <code>FixedController</code> (diagnostic-only) and <code>RuleBasedController</code> (comparison arm + fallback).</td></tr>
+  <tr><td class="mono">mcp_server.py</td><td>The FastMCP stdio server exposing the 5 tools.</td></tr>
+  <tr><td class="mono">mcp_bridge.py</td><td>Synchronous facade over the async MCP client session, running it on a background thread.</td></tr>
+  <tr><td class="mono">agent.py</td><td>The LLM supervisor: system prompt, JSON schema, self-correction loop, decision cache, telemetry.</td></tr>
+  <tr><td class="mono">shared_state.py</td><td>Atomic cross-process JSON read/write (<code>runtime_state.json</code>, <code>pending_policy.json</code>), including the Windows sharing-violation retry.</td></tr>
+  <tr><td class="mono">log_tools.py</td><td>Filter → dedupe → truncate pipeline for EnergyPlus <code>.err</code> logs.</td></tr>
+  <tr><td class="mono">metrics.py</td><td>Computes kWh, peak kW, comfort violation % from <code>eplusout.csv</code> — the authoritative source, not the live meter readings.</td></tr>
+  <tr><td class="mono">run_experiment.py</td><td>Runs one or all three controller modes and writes <code>results/summary.json</code>.</td></tr>
+  <tr><td class="mono">export_idf.py</td><td>Bakes the agent's applied setpoints into standalone <code>agent_optimized.idf</code>.</td></tr>
+  <tr><td class="mono">compare_models.py</td><td>Side experiment: identical loop, a different local model, to isolate model-choice effects.</td></tr>
+  <tr><td class="mono">endurance_run.py</td><td>Runs the full pipeline over a whole cooling season (June–August) to check nothing degrades over a longer horizon.</td></tr>
+  <tr><td class="mono">make_stress_log.py</td><td>Generates a synthetic warning-heavy <code>.err</code> file to exercise <code>log_tools.py</code>'s compression on a harder case than this project's own (clean) logs produce.</td></tr>
+  <tr><td class="mono">package_submission.py</td><td>Bundles the deliverables into the <code>submission/</code> archive.</td></tr>
+  <tr><td class="mono">test_clamp.py</td><td>Unit tests: throws hostile input at the safety clamp (strings, NaN, booleans, inverted pairs, malformed payloads).</td></tr>
+  <tr><td class="mono">test_actuation.py</td><td>Proves the actuators are genuinely connected — a loose deadband must lower energy, a tight one must raise it.</td></tr>
+  <tr><td class="mono">test_mcp_client.py</td><td>Standalone MCP client that starts a real simulation in a background thread and exercises all 5 tools while it's running.</td></tr>
+</table>
+
+<h2>models/ — the three IDFs, and what "IDF" even is</h2>
+<p>An <strong>IDF</strong> (Input Data File) is EnergyPlus's native building
+description format — geometry, zones, schedules, systems, all as plain text
+objects.</p>
+<table>
+  <tr><th>File</th><th>What it is</th></tr>
+  <tr><td class="mono">baseline.idf</td><td>The untouched <code>5ZoneAirCooled</code> example, exactly as EnergyPlus ships it.</td></tr>
+  <tr><td class="mono">simulation.idf</td><td>Built by <code>prepare_model.py</code>: same building, trimmed run period, instrumented outputs.</td></tr>
+  <tr><td class="mono">agent_optimized.idf</td><td>Built by <code>export_idf.py</code> <em>after</em> a real agent run — the agent's learned policy, reconstructed into real <code>Schedule:Compact</code> objects. Runs standalone.</td></tr>
+</table>
+<p>Why <code>agent_optimized.idf</code> has to be reconstructed at all:
+actuating the EnergyPlus API during a run changes values only in memory —
+nothing about "what the agent actually did" persists to a file on its own.
+This script is what turns a live decision-making process into a portable,
+inspectable artifact.</p>
+
+<h2>The documentation files, and what each is actually <em>for</em></h2>
+<table>
+  <tr><th>File</th><th>Audience / purpose</th></tr>
+  <tr><td class="mono">README.md</td><td>Front door: setup instructions, the one-command run, the results table, and the honest-limitations section. Written for someone deciding whether to run the project.</td></tr>
+  <tr><td class="mono">ARCHITECTURE.md</td><td>The technical deep-dive, structured around 4 required sections: tool-calling architecture, prompt engineering strategy, latency management, and log-handling. Written for someone evaluating <em>how</em> it's built — this is effectively the source material for Lessons 3–5 here.</td></tr>
+  <tr><td class="mono">SUBMISSION.md</td><td>A deliverable-to-evaluation-criteria map: for each grading criterion (System Integration 30%, Energy Efficiency 25%, Comfort 20%, Agentic Autonomy 15%, Documentation 10%), it states exactly where the evidence lives and cites the reproducing command. Written for a grader/evaluator, not a general reader.</td></tr>
+  <tr><td class="mono">docs/presentation.md</td><td>Slide-by-slide content for a 6-slide pitch deck (this is a Smart India Hackathon / SIH-style submission), mapped onto a provided template.</td></tr>
+  <tr><td class="mono">docs/DEMO_SCRIPT.md</td><td>A timed shot list and narration script for a &lt;3-minute demo video, including the exact commands to run live on camera.</td></tr>
+</table>
+
+<div class="callout">
+  <span class="label">Interview framing</span>
+  If asked "what's the difference between ARCHITECTURE.md and SUBMISSION.md,"
+  the crisp answer is: ARCHITECTURE.md explains <em>how the system works</em>;
+  SUBMISSION.md explains <em>where to find proof it works</em>, organized
+  around someone else's grading rubric rather than around the system itself.
+</div>
+
+<details class="quiz">
+  <summary>Quick check: which file would you open to find why the "Electricity:Facility" meter isn't used directly?</summary>
+  <div class="answer"><code>src/config.py</code> — the comment on
+  <code>FACILITY_METERS</code> explains that the aggregate meter doesn't
+  resolve to a usable handle in this EnergyPlus version, so three sector
+  meters (Building/HVAC/Plant electricity) are summed instead, verified to
+  match the facility total exactly.</div>
+</details>
+
+<div class="ask-agent">Ask me to open any specific file from this map and
+walk through it live — that's often faster than re-reading a table.</div>
+
+<div class="nav">
+  <a href="0005-key-decisions.html">← Lesson 5</a>
+  <a href="0007-results-and-outputs.html">Lesson 7 → Results & Outputs</a>
+</div>

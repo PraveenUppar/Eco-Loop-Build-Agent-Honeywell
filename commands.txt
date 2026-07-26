@@ -1,1 +1,7 @@
-python src/run_experiment.py --mode agent --demo
+```bash
+python src/prepare_model.py && python src/run_experiment.py --mode all
+```
+
+```bash
+python dashboard/build_report.py
+```

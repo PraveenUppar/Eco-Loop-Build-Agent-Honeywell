@@ -1,0 +1,102 @@
+<title>8 · Packages and Tools</title>
+<link rel="stylesheet" href="../assets/style.css">
+<span class="kicker">Eco-Loop · Lesson 8 of 10</span>
+<h1>Packages and tools used, and why each one</h1>
+<p class="dek">Every dependency this project has, what it's for, and — for the
+two big infrastructure pieces (EnergyPlus and MCP) that aren't pip packages —
+enough first-principles background to talk about them without hand-waving.</p>
+
+<h2>Python dependencies (requirements.txt)</h2>
+<table>
+  <tr><th>Package</th><th>What it's for in this project</th></tr>
+  <tr><td class="mono">eppy</td><td>Reads and writes EnergyPlus <code>.idf</code> files as Python objects. Used by <code>prepare_model.py</code> (build the instrumented model) and <code>export_idf.py</code> (write <code>agent_optimized.idf</code>).</td></tr>
+  <tr><td class="mono">mcp</td><td>The official Model Context Protocol SDK — provides <code>FastMCP</code> (the server framework, <code>mcp_server.py</code>) and the client session classes (<code>mcp_bridge.py</code>).</td></tr>
+  <tr><td class="mono">numpy</td><td>Numeric array support, a dependency of pandas/plotly rather than used heavily by name in this project's own code.</td></tr>
+  <tr><td class="mono">ollama</td><td>Python client for the local Ollama server — <code>agent.py</code> uses <code>ollama.Client(...).chat(...)</code> to call the model.</td></tr>
+  <tr><td class="mono">pandas</td><td>Reads <code>eplusout.csv</code> and computes the metrics/timeseries tables (<code>metrics.py</code>).</td></tr>
+  <tr><td class="mono">plotly</td><td>Builds the 5 interactive charts in <code>dashboard/report.html</code>.</td></tr>
+</table>
+<p><code>pyenergyplus</code> — the Python API into the simulation engine
+itself — is deliberately <strong>not</strong> in this list. It isn't a pip
+package; it ships inside the EnergyPlus installation and the code adds it to
+<code>sys.path</code> at runtime from <code>ENERGYPLUS_DIR</code>
+(<code>src/config.py</code>). Worth knowing so you don't imply it was
+pip-installed if asked.</p>
+
+<h2>EnergyPlus — the physics engine underneath everything</h2>
+<p>EnergyPlus is a whole-building energy simulation engine (originally
+developed for the U.S. Department of Energy) that models heat transfer,
+airflow, HVAC systems, and equipment loads at a physical level — not a
+toy approximation. This project uses it two ways:</p>
+<ul>
+  <li><strong>As a subprocess</strong> normally, run via its command-line
+    interface with an IDF + weather file.</li>
+  <li><strong>In-process, via <code>pyenergyplus</code></strong> — this
+    project's actual mode. The Python API lets code register callback
+    functions that fire at specific points during the simulation loop
+    (Lesson&nbsp;4), which is what makes the "closed loop while the
+    simulation is running" claim literally true rather than a simulated
+    approximation.</li>
+</ul>
+
+<h2>Ollama — the local LLM server</h2>
+<p>Ollama is a program that downloads and serves language models locally —
+no cloud account, no per-call API cost, no network dependency at inference
+time. This project pulls one model:</p>
+<pre><code>ollama pull qwen2.5:3b-instruct</code></pre>
+<p><code>qwen2.5:3b-instruct</code> is an <strong>instruction-tuned</strong>
+model (trained to follow prompts/instructions rather than just continue
+text) at the 3-billion-parameter size — small enough to run on a single
+laptop with acceptable latency (median 3.27s per call), which is precisely
+why the rest of the system exists to compensate for a small model's
+unreliability rather than assuming a large, expensive cloud model.</p>
+
+<h2>MCP — Model Context Protocol, from first principles</h2>
+<p>MCP is a standard way for an AI application to expose a defined set of
+<strong>tools</strong> (callable functions with typed arguments and
+descriptions) to a model, over a well-specified protocol — instead of every
+project inventing its own ad hoc function-calling glue.</p>
+<div class="flow">
+  <div class="flow-box"><span class="t">MCP client</span><span class="s">the agent's side — lists available tools, calls them, gets results back</span></div>
+  <div class="flow-arrow">↔ stdio transport (this project) ↔</div>
+  <div class="flow-box"><span class="t">MCP server</span><span class="s"><code>mcp_server.py</code>, launched as a separate process, exposing 5 tools</span></div>
+</div>
+<p><strong>stdio transport</strong> means the client and server talk over the
+server subprocess's standard input/output streams — no network port, no
+sockets, just a pipe. This project's server is launched with
+<code>StdioServerParameters(command=sys.executable, args=[...])</code> and
+communicates with a plain <code>ClientSession</code> from the MCP SDK.
+<strong>FastMCP</strong> (used in <code>mcp_server.py</code>) is a thin
+decorator-based framework — <code>@mcp.tool()</code> above a function turns
+it into a tool the protocol exposes automatically, including generating the
+schema from the function's type hints and docstring.</p>
+
+<h2>Structured output / JSON schema constraints</h2>
+<p>Separate from MCP: when the agent asks Ollama for a decision, it passes a
+JSON schema in the <code>format</code> parameter (Lesson&nbsp;5). This is a
+different mechanism from tool calling — it constrains the shape of the
+model's raw text output, rather than letting the model choose to invoke a
+function. Worth being able to distinguish the two if asked: <strong>tool
+calling</strong> is how the agent reads sensors and writes setpoints (through
+MCP); <strong>structured output</strong> is how the model's own reply gets
+forced into valid JSON in the first place.</p>
+
+<details class="quiz">
+  <summary>Quick check: why does the agent talk to EnergyPlus data through MCP tools instead of just reading Python objects directly, given they're conceptually "the same process"?</summary>
+  <div class="answer">They're actually not the same process — the MCP
+  server is a genuinely separate subprocess (Lesson 4), so it literally
+  cannot import the simulation's Python objects even if it wanted to. But
+  even setting that aside, going through MCP tools is what makes "the agent
+  uses tools with validated inputs/outputs" a real architectural property
+  instead of the agent having unrestricted access to internal state.</div>
+</details>
+
+<div class="ask-agent">If "instruction-tuned" or "structured output" are new
+terms, ask me to unpack either one further, or check
+<code>reference/glossary.html</code> for a one-line definition of every term
+used across all 10 lessons.</div>
+
+<div class="nav">
+  <a href="0007-results-and-outputs.html">← Lesson 7</a>
+  <a href="0009-drawbacks-and-improvements.html">Lesson 9 → Drawbacks & Improvements</a>
+</div>
