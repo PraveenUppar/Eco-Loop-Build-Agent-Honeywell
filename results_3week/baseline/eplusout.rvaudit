@@ -1,0 +1,16 @@
+ ReadVarsESO
+ processing:C:\Users\pavii\Desktop\V2\models\simulation.rvi
+ input file:C:\Users\pavii\Desktop\V2\results\baseline\eplusout.eso
+ output file:C:\Users\pavii\Desktop\V2\results\baseline\eplusout.csv
+ getting all vars from:C:\Users\pavii\Desktop\V2\results\baseline\eplusout.eso
+  number variables requested for output=          29
+ ReadVars Run Time=00hr 00min  0.89sec
+ ReadVarsESO program completed successfully.
+ ReadVarsESO
+ processing:C:\Users\pavii\Desktop\V2\models\simulation.mvi
+ input file:C:\Users\pavii\Desktop\V2\results\baseline\eplusout.mtr
+ output file:C:\Users\pavii\Desktop\V2\results\baseline\eplusmtr.csv
+ getting all vars from:C:\Users\pavii\Desktop\V2\results\baseline\eplusout.mtr
+  number variables requested for output=           3
+ ReadVars Run Time=00hr 00min  0.16sec
+ ReadVarsESO program completed successfully.

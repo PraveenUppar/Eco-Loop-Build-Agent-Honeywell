@@ -1,0 +1,1 @@
+python src/run_experiment.py --mode agent --demo

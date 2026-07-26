@@ -1,3 +1,22 @@
+# EnergyPlus working output -- large, regenerable, and noisy in diffs
+out/
+results_2week/
+
+# Simulation artefacts inside results/: keep metrics.json, summary.json,
+# timeseries.csv, run_log.jsonl and llm_calls.jsonl; drop the rest.
+results/**/eplusout.*
+results/**/eplusmtr.csv
+results/**/eplustbl.htm
+results/**/epluspsz.csv
+results/**/eplusssz.csv
+results/**/epluszsz.csv
+
+# NOTE: models/*.idf are deliberately NOT ignored. Deliverable 2 asks for the
+# baseline file plus the modified versions generated during runtime, so
+# baseline.idf, simulation.idf and agent_optimized.idf are all committed.
+
 __pycache__/
 *.pyc
-out/
+.venv/
+venv/
+.DS_Store

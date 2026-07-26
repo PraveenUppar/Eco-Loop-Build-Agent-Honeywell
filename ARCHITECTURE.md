@@ -1,338 +1,404 @@
-# System Architecture — Eco-Loop Building Agent
+# Architecture
 
-A closed-loop supervisory controller for building HVAC: a locally-hosted
-open-source LLM ingests live zone state, reasons about comfort, price and
-grid carbon intensity, and injects setpoints back into a running
-simulation each cycle.
-
-This document covers the four things the brief asks for — tool-calling
-architecture, prompt engineering, latency management, and handling long
-simulation logs — plus the measured results and an honest account of what
-does and does not work.
+A local LLM supervises a live EnergyPlus simulation through an MCP tool layer,
+reading sensors and writing thermostat setpoints while the simulation runs.
 
 ---
 
-## 1. Overview
+## 1. Tool-calling architecture
 
-```
-      ┌──────────────────────────────────────────────┐
-      │  Simulation  (MockBuilding / EnergyPlus)     │
-      │  zone temp · outdoor temp · occupancy · PMV  │
-      └───────────────┬──────────────────────────────┘
-                      │ get_zone_state / get_grid_forecast
-                      ▼
-      ┌──────────────────────────────────────────────┐
-      │  HVACAgent   (Ollama, qwen2.5-coder:1.5b)    │
-      │  tool-calling loop, greedy decoding          │
-      └───────────────┬──────────────────────────────┘
-                      │ proposed setpoint
-                      ▼
-      ┌──────────────────────────────────────────────┐
-      │  Supervisor  (deterministic override layer)  │
-      │  comfort interlock · preheat · load shifting │
-      └───────────────┬──────────────────────────────┘
-                      │ set_zone_setpoint (clamped 18–26 °C)
-                      ▼
-              back into the simulation
-```
+### The loop
 
-Each cycle the agent reads state, decides, and calls a tool. Every
-setpoint passes through two independent safety layers before reaching the
-simulation: the supervisor (situational) and a hard clamp in `tools.py`
-(absolute). The LLM cannot bypass either.
+```mermaid
+flowchart TB
+    subgraph sim["EnergyPlus process (in-process API)"]
+        EP["EnergyPlus 26.1<br/>5-zone VAV office"]
+        CB1["callback:<br/>begin_system_timestep_before_predictor"]
+        CB2["callback:<br/>end_zone_timestep_after_zone_reporting"]
+        INNER["Inner loop (deterministic, every 15 min)<br/>clamp -> operating envelope -> actuators"]
+        EP -->|every timestep| CB1 --> INNER -->|set_actuator_value| EP
+        EP -->|once per zone timestep| CB2
+    end
 
-**Modules**
+    subgraph shared["Shared state (atomic JSON, os.replace)"]
+        RS[["runtime_state.json<br/>sim -> tools"]]
+        PP[["pending_policy.json<br/>tools -> sim"]]
+    end
 
-| File | Responsibility |
-|---|---|
-| `tools.py` | Thermal model, comfort/safety clamp, tool schemas and executor |
-| `grid.py` | Time-of-use price and grid carbon intensity curves |
-| `llm_agent.py` | Ollama tool-calling loop, prompt, fallback parser |
-| `supervisor.py` | Deterministic override layer + intervention accounting |
-| `run_loop.py` | Orchestration, four run modes, CSV logging |
-| `dashboard/` | Baseline-vs-agent comparison and charts |
+    subgraph mcpsrv["MCP server process (stdio)"]
+        T1["get_building_state"]
+        T2["get_energy_summary"]
+        T3["set_setpoints"]
+        T4["read_simulation_errors"]
+        T5["list_zones"]
+    end
 
----
+    LLM["qwen2.5:3b-instruct<br/>via Ollama (local)"]
 
-## 2. Tool-calling architecture
-
-**Transport.** Direct tool-calling via Ollama's OpenAI-compatible
-`chat(..., tools=...)` API rather than a standalone MCP server — fewer
-moving parts under a deadline. `TOOL_SCHEMAS` in `tools.py` is already in
-OpenAI/MCP-compatible function-schema form, so migrating to a real MCP
-server is a transport swap, not a redesign.
-
-**Tools exposed to the model**
-
-| Tool | Purpose |
-|---|---|
-| `get_zone_state` | Temperature, outdoor temperature, occupancy, PMV, minutes until occupancy changes, current price/carbon, minutes until price peak |
-| `get_grid_forecast` | Six-hour price and carbon forecast, for deciding *when* to heat |
-| `set_zone_setpoint` | The only write path into the simulation |
-
-**Safety is enforced in code, never in the prompt.** `clamp_setpoint()`
-restricts every request to 18–26 °C regardless of what the model asks
-for. The narrower 20–24 °C comfort band is what the dashboard audits.
-Two tiers: a hard safety rail and a comfort target.
-
-**Self-correction.** Malformed tool arguments are caught and returned to
-the model as a tool-result error rather than crashing the loop, giving it
-a chance to retry within the same cycle (max 4 tool rounds).
-
-**Fallback tool-call parser.** `qwen2.5-coder:1.5b` does not reliably
-emit the `<tool_call>` tags its own chat template requires, so Ollama
-often returns tool calls as plain text in `message.content` with an empty
-`tool_calls` field. Symptom: the setpoint never moved off its default for
-an entire 24-hour run. `_parse_fallback_tool_calls()` scans message
-content for balanced-brace JSON objects naming a known tool and
-normalises the malformed argument shapes actually observed —
-markdown-fenced JSON, `"arguments": null`, arguments as a JSON-encoded
-string, and multiple concatenated objects.
-
----
-
-## 3. Prompt engineering strategy
-
-The prompt went through five revisions. What worked was not better
-phrasing but **lower cognitive load**.
-
-| Revision | Result |
-|---|---|
-| Priority hierarchy in prose ("comfort takes precedence over energy") | Setpoints stuck at default; then oscillating 21→18→24→23→20 |
-| Explicit numeric setback ("hold 18.0 °C when empty") | Held steady, but energy 13.9% worse than baseline |
-| Four-branch conditional with preheat | 40/40 occupied steps in comfort violation |
-| Flat `condition → exact number` rule table | Model emitted `18.915` — a value from no rule |
-| Same table, plus greedy decoding | Usable; 12.5% override rate (3 rules) |
-| Five rules, after adding grid-awareness | 60.4% override rate |
-| Cut back to three rules, three output values | 95.8% override rate; 44/48 cycles produced no setpoint |
-| State injected into the prompt instead of fetched | Always answered, but 1/6 correct — reverted |
-
-**Findings that generalise:**
-
-- **Flat rule tables beat priority hierarchies.** A 1.5 B model cannot
-  reliably evaluate "apply the first rule that matches" across four
-  nested conditions. Each rule now maps a condition to one exact number.
-- **Name the number, never describe it.** "Near the low end of the safe
-  range" produced 23 °C. "Exactly 18.0" produced 18.0.
-- **State stability is correct.** Without an explicit instruction that
-  repeating the previous setpoint is expected, the model treated every cycle
-  as needing a fresh answer and oscillated.
-- **Determinism is non-negotiable for control.** At Ollama's default
-  sampling temperature, identical code produced wildly different 24-hour
-  outcomes, making every A/B comparison meaningless. Fixed with
-  `temperature: 0.0` and `seed: 42`.
-
-**The honest limit — a capability probe, not a phrasing problem.**
-To establish whether any prompt could work, the task was stripped to the
-simplest form it can take: two pre-computed booleans, a three-line lookup
-table, no arithmetic, no thresholds, no multi-step tool flow.
-
-```
-building_empty_for_a_while is true   -> 18.0
-price_peak_coming_soon is true       -> 23.5
-otherwise                            -> 20.5
+    CB2 -->|publish sensors| RS
+    CB2 -->|every 4 sim hours| AGENT["Agent supervisor"]
+    AGENT -->|MCP call| T1
+    AGENT -->|MCP call| T2
+    AGENT -->|prompt| LLM
+    LLM -->|JSON policy| AGENT
+    AGENT -->|MCP call| T3
+    T3 -->|validated| PP
+    PP -->|consumed next timestep| INNER
+    T3 -.->|rejection + reason| AGENT
+    RS --> T1 & T2 & T5
 ```
 
-The model scored 3/6 — and the three it got right were exactly the three
-whose answer was the `otherwise` line. It failed every case where a flag
-was true. It is not reading the input; it emits a constant.
+### Why two callbacks
 
-There is nothing below this to simplify. Anything further means writing
-the answer into the prompt, at which point the model is not controlling
-anything. Two related failures point the same way:
-
-- **Numeric thresholds fail.** "more than 120", "between 1 and 120" —
-  every miss in the three-rule version was a range comparison.
-- **It copies numbers out of its input.** It answered `21.0` (the current
-  setpoint, permitted by no rule) and earlier `18.915` (the current zone
-  temperature). `setpoint_c` was removed from the state passed to it for
-  this reason.
-
-This is why the supervisor exists (§5), and why the model is the binding
-constraint on this project rather than the prompt.
-
----
-
-## 4. Latency management
-
-| Metric | Value |
-|---|---|
-| Model | `qwen2.5-coder:1.5b` (986 MB) via Ollama |
-| Mean latency per agent decision | ~2.0 s |
-| Typical range | 0.3 – 5 s |
-| Decision cadence | `--agent-every-n-steps` (4 = hourly at 15-min steps) |
-
-Three controls:
-
-1. **Decoupled decision cadence.** The agent runs every *N* simulation
-   steps, holding its setpoint between calls. At `N=4` a 48-hour run costs
-   48 LLM calls rather than 192 — the control problem does not change
-   meaningfully every 15 minutes.
-2. **Bounded generation.** `num_predict: 300` caps tokens per turn. One
-   run hung for 10+ minutes when the model fell into a degenerate
-   repetition loop with no cap.
-3. **Client timeout.** `ollama.Client(timeout=60)` as a second safety
-   net, so a stalled request cannot block the loop indefinitely.
-
-Latency is logged per step (`latency_s`) and surfaced on the dashboard.
-
-**Hardware note.** `qwen2.5-coder:7b` was the intended model but does not
-run on the development machine (8 GB RAM, RTX 2050 with 4 GB VRAM) —
-Ollama reports `model requires more system memory (1.8 GiB) than is
-available` and the runner terminates. The model name is a single
-constant (`DEFAULT_MODEL`) plus a `--model` flag.
-
----
-
-## 5. The supervisory override layer
-
-Because the LLM cannot be trusted to hold comfort on its own, a
-deterministic layer sits between its proposal and the simulation. It
-overrides only physically indefensible proposals; anything merely
-suboptimal is left alone, so the agent retains real authority.
-
-| Rule | Trigger | Action |
+| Callback | Job | Why this one |
 |---|---|---|
-| 1 | Occupied, zone outside comfort band, proposal not targeting the band | Drive to comfort |
-| 2 | Occupancy imminent, proposal too low to preheat in time | Preheat |
-| 3 | Building empty, occupancy not imminent, proposal above setback | Setback |
-| 4 | Occupants leaving soon, zone projected to stay comfortable | Coast on thermal mass |
-| 5 | Price peak approaching, power still cheap | Pre-charge thermal mass |
-| 6 | Peak active, stored heat available | Discharge instead of buying |
+| `begin_system_timestep_before_predictor` | **Actuate** | Fires before the zone predictor computes loads, so a setpoint written here affects the current timestep. This is the correct hook for setpoint control. |
+| `end_zone_timestep_after_zone_reporting` | **Sense + decide** | Fires exactly once per zone timestep. EnergyPlus shortens the *system* timestep during difficult HVAC iterations, so reading meters in the actuation callback would double-count energy. |
 
-**Intervention rate is reported, not hidden.** `OverrideStats` tracks it,
-every step logs `agent_proposed_c` / `overridden` / `override_reason`,
-and the dashboard displays the percentage with a caption stating that a
-high rate means the results reflect the rules rather than the model.
-`--no-supervisor` measures unassisted agent quality, and a `mock-rules`
-mode runs the rules with **no LLM at all** as an experimental control —
-that arm is what makes the model's true contribution legible.
+### Why supervisory, not per-timestep
 
-This mirrors real BMS practice, where supervisory optimisation sits under
-a comfort interlock. The difference between honest and dishonest use of
-that pattern is whether the intervention rate is published.
+The LLM sets **policy**; a deterministic inner loop **applies** it every timestep.
+
+This is an engineering decision, not a shortcut:
+
+- **Latency.** At 15-minute timesteps a three-week run is 2016 timesteps. Calling
+  a model on each one, at ~2.9 s per call, would add **over 90 minutes** to a
+  simulation that itself takes 8 seconds.
+- **It matches how buildings are actually controlled.** Real BMS supervisory
+  logic resets setpoints on a slow loop; fast local control loops track them.
+  Putting a language model in the inner loop would be the wrong design even if
+  it were free.
+- **Stability.** A policy that holds for four hours cannot oscillate at
+  timestep frequency.
+
+### The five tools
+
+| Tool | Returns / does |
+|---|---|
+| `get_building_state()` | Zone temperatures and RH, outdoor drybulb, occupancy, energy to date, and the policy currently in force |
+| `get_energy_summary(window_hours)` | kWh and peak kW over a trailing window, plus the running delta against the baseline run |
+| `set_setpoints(heating_c, cooling_c, zone, reason)` | **Validates** and applies a setpoint policy, or rejects it with a specific, actionable reason |
+| `read_simulation_errors(max_lines)` | Severity-filtered, deduplicated `.err` summary (see §4) |
+| `list_zones()` | Conditioned zone names and floor areas |
+
+### Crossing the process boundary
+
+The MCP server is a separate stdio subprocess, so it cannot see the
+simulation's Python objects. The exchange is two small JSON files written with
+`os.replace`, which is atomic on NTFS, so a reader never sees a half-written
+file.
+
+One real bug surfaced here and is worth recording: on Windows, `os.replace`
+raises `WinError 5` if the destination is currently open in another process.
+With the server polling state while the simulation writes it 2016 times, this
+fired constantly. The fix is a short bounded retry on both sides, treating
+state as telemetry — a dropped write is preferable to killing a simulation,
+because the next timestep republishes.
+
+### Calling async tools from a sync callback
+
+The EnergyPlus callback is an ordinary synchronous function; the MCP client
+session is asyncio-based and must stay open for the whole run. `mcp_bridge.py`
+runs the session on its own event loop in a background thread and submits
+coroutines with `run_coroutine_threadsafe`. The agent therefore talks to a
+**real MCP server over stdio** rather than importing the tool functions
+directly.
+
+### The safety envelope
+
+No policy reaches an actuator without passing through validation, whatever its
+source. This is load-bearing rather than decorative, because the supervisor is
+a 3B model.
+
+```
+LLM output -> JSON schema -> clamp_pair() -> tool-layer occupancy check
+           -> operating_envelope() every timestep -> actuator
+```
+
+| Layer | Enforces |
+|---|---|
+| `clamp_pair` | heating 18–22 °C, cooling 23–27 °C, deadband ≥ 1.5 °C. Non-numeric, `NaN`, `inf`, booleans and inverted pairs all resolve to a safe policy. |
+| `set_setpoints` | Context-aware. **Occupied:** rejects cooling above 25 °C. **Empty:** rejects cooling below 26 °C — running plant for nobody. Rejections carry the reason, which drives self-correction. |
+| `operating_envelope` | Runs in the inner loop *every timestep*, independent of what the supervisor asked for 4 hours ago. Pulls setpoints into the comfort band when occupied; pushes them out to setback when empty. |
+
+The middle layer matters because the supervisor decides every four hours: a
+setback chosen at 04:00 would otherwise still be in force at 06:00 when people
+arrive.
+
+`test_clamp.py` exercises this against deliberately hostile input — out-of-range
+values, strings, `None`, `NaN`/`inf`, booleans, inverted setpoints, unknown zone
+names and four malformed LLM payloads. Every case lands inside the envelope.
 
 ---
 
-## 6. Handling long simulation logs
+## 2. Prompt engineering strategy
 
-- **Streamed, not buffered.** CSV rows are written per step, so a
-  multi-day horizon does not grow unbounded memory.
-- **The agent never sees raw logs.** It receives a small structured state
-  dict per cycle — roughly 8 fields — rather than accumulated history.
-  Log length is therefore decoupled from prompt length, which is what
-  keeps latency flat over long horizons.
-- **Fresh conversation per decision.** Each cycle starts a new message
-  list, so context cannot grow without bound across a run.
-- **Aggregate reporting.** The dashboard summarises (sums, means,
-  violation counts) rather than rendering every row.
-- **UTF-8 explicitly.** Log files are opened with `encoding="utf-8"`;
-  the Windows default (cp1252) silently corrupted files when the model's
-  reasoning text contained a `°` character.
+### Teach the domain, do not dictate the answer
+
+The first version of the system prompt listed rules ("raise cooling_c to save
+energy"). It underperformed, and the failure was diagnosable: on hot days the
+model chose cooling 23.5 °C — the most expensive legal option — reasoning that
+it was hot outside so more cooling was needed.
+
+That is a **conceptual** error, not an instruction-following error. The model
+was treating the cooling setpoint as "amount of cooling" rather than as a
+threshold. So the prompt was rewritten to explain the mechanism:
+
+- what a setpoint actually is (a threshold, not a target)
+- what the deadband is, and that no energy is spent inside it
+- therefore *why* raising `cooling_c` reduces energy, and lowering it increases energy
+- the specific misconception, named and corrected
+- what occupancy changes about the objective
+- why sudden setpoint drops create demand peaks
+
+A model that understands the mechanism generalises to situations the rules do
+not enumerate. Rules alone produced a model that pattern-matched "hot → cool
+harder".
+
+### Structured output, not prose parsing
+
+Ollama is given an explicit **JSON schema**, not just `format: "json"`:
+
+```python
+POLICY_SCHEMA = {
+  "type": "object",
+  "properties": {"heating_c": {"type": "number"},
+                 "cooling_c": {"type": "number"},
+                 "reason":    {"type": "string"}},
+  "required": ["heating_c", "cooling_c", "reason"],
+}
+```
+
+This does more for reliability on a 3B model than any amount of polite asking:
+**0 malformed JSON responses** across every reported run.
+
+### History compaction
+
+The model receives the last **six** decisions as a fixed-width table — time,
+setpoints, cumulative kWh, mean zone temperature — not a transcript. Cost is
+bounded regardless of run length, and the trend stays visible.
+
+```
+RECENT DECISIONS (most recent last)
+  time        htg   clg   kWh/4h  avgC
+  07-03 08:15 20.0  25.0  421.0   23.8
+```
+
+### Context-aware constraint block
+
+The legal range is restated **per call**, because it depends on occupancy:
+
+```
+ALLOWED NOW (people present): heating_c 20.0-22.0, cooling_c 23.0-25.0.
+The top of the cooling range is the cheap end; the bottom is the expensive end.
+```
+
+Stating the currently-binding constraint in the user turn — where a small model
+weights it most — cut tool rejections sharply.
+
+### Self-correction
+
+When the model returns unparseable JSON, or the tool layer rejects the policy,
+the **specific failure** is appended to the conversation and the model retries
+(up to 2 attempts):
+
+> That was rejected: building is OCCUPIED: cooling_c 27.0 exceeds the comfort
+> limit 25.0 C. Reply with corrected JSON only, obeying …
+
+If it still cannot produce a usable policy, the rule-based controller takes
+that interval. The building is never left without a policy.
+
+### Budget
+
+System prompt ≈ 620 tokens, per-call user prompt ≈ 360 tokens — roughly **1000
+tokens per decision**, comfortably inside the 1500-token target.
 
 ---
 
-## 7. Results
+## 3. Prompt latency management
 
-48-hour horizon, winter profile (−1 °C to 9 °C), 15-minute steps.
-Baseline is a fixed setback schedule: 21 °C occupied, 18 °C otherwise.
+### The arithmetic
 
-Three arms are reported. `mock-rules` — the supervisor rules with **no
-LLM at all** — is the experimental control, and it is the arm that makes
-the language model's true contribution legible.
+| | Per-timestep control | Supervisory (chosen) |
+|---|---|---|
+| Timesteps (3 weeks @ 15 min) | 2016 | 2016 |
+| Supervisory decisions | 2016 | **126** |
+| Model invocations (incl. retries) | ~2050 | **102** |
+| At 3.27 s median | **~110 minutes** | **5.8 minutes** |
+| Simulation itself | 12 s | 12 s |
 
-| | Energy (kWh) | Cost | CO₂ (kg) | Peak-window kWh | Comfort violations | Overrides |
-|---|---|---|---|---|---|---|
-| Fixed schedule (baseline) | 57.38 | 8.18 | 15.49 | 7.57 | 8 / 80 | — |
-| Rules only, no LLM | 58.11 | **7.84** | **15.14** | 5.73 | **0 / 80** | — |
-| LLM + supervisor | 60.37 | 8.08 | 15.73 | 5.52 | **0 / 80** | 60.4 % |
+Calling the model every timestep would make the LLM roughly **550×** the cost of
+the physics it is steering. Re-planning every 4 simulated hours brings that to
+something a demo can actually run.
 
-Change versus baseline:
+### Decision cache
 
-| | Cost | CO₂ | Peak-window energy |
+Situations repeat — 02:00 on consecutive empty weeknights at the same outdoor
+temperature is the same decision. Decisions are cached on a **bucketed** key:
+
+```python
+(hour // 4, occupied, round(outdoor_temp), round(mean_zone_temp))
+```
+
+Rounding is what makes the cache hit at all; exact float state never repeats.
+
+Note that `llm_calls` counts every model invocation, retries included, so it is
+not the decision count. One decision costs either a cache hit, or one call plus
+however many retries it needed:
+
+```
+decisions = llm_calls - retries + cache_hits
+          = 102       - 16      + 40         = 126
+```
+
+### Measured (3-week run)
+
+| | |
+|---|---|
+| Supervisory decisions | 126 |
+| Model invocations | 102 |
+| Cache hits | 40 — **31.7 %** hit rate |
+| Median latency | **3.27 s** |
+| Total LLM time | 348 s |
+| Total wall clock | 360 s |
+| **EnergyPlus simulation alone** | **12 s** |
+
+The agent's wall clock is almost entirely LLM time; the physics underneath is
+twelve seconds. That ratio is the whole argument for supervisory cadence — and
+the cache removes nearly a third of the calls outright.
+
+### What else keeps it off the critical path
+
+- `num_predict` capped at 160 tokens; the reply is three fields
+- History fixed at six rows, so prompt size does not grow with run length
+- Cache hits cost **0 ms** — no request is made
+- A failed call degrades to the rule-based policy rather than blocking
+
+---
+
+## 4. Handling lengthy simulation logs
+
+An EnergyPlus `.err` file is mostly repetition: the same warning re-emitted per
+timestep or per object, with only the identifiers changing. Passing it raw into
+a prompt spends the context window on noise.
+
+### The pipeline
+
+**1. Filter.** Keep only `** Severe **`, `** Fatal **` and `** Warning **`
+records. Drop the informational preamble and the `**   ~~~   **` continuation
+lines, which carry no new signal.
+
+**2. Deduplicate.** Normalise the *varying* parts out of each message so repeats
+hash together, then count:
+
+- timestamps and date strings → `<TIME>`
+- upper-case EnergyPlus object identifiers → `<NAME>`
+- quoted strings → `<NAME>`
+- all numbers → `#`
+
+Identifier substitution runs **before** quote substitution — the other order
+lets the placeholder match itself and produces `<<NAME>>`.
+
+**3. Truncate.** Rank by severity first, then occurrence count, and keep the top
+K. The worst problems survive truncation; the tool never returns a raw log.
+
+Collapsed entries keep up to three concrete example names, so the reader retains
+enough context to act:
+
+```
+[WARNING] Calculated design heating load for zone=<NAME> is zero.  x14
+          (e.g. FLOOR 1 KITCHEN, FLOOR 2 CLEAN 2, FLOOR 2 EXAM 3...)
+```
+
+### Measured compression
+
+Tested on a genuine EnergyPlus log — an annual run of the `HospitalBaseline`
+example with `Output:Diagnostics, DisplayAllWarnings` enabled. Not a synthetic
+fixture.
+
+| | Before | After | Reduction |
 |---|---|---|---|
-| Rules only | **−4.2 %** | **−2.3 %** | **−24.3 %** |
-| LLM + supervisor | −1.2 % | **+1.5 % (worse)** | −27.0 % |
+| Lines | 596 | 9 | **66×** |
+| Approx. tokens | 13,769 | 295 | **46.7×** |
+| Distinct issues | — | 8 (from 56 occurrences) | — |
 
-**The load-shifting strategy works.** Peak-window draw falls by roughly a
-quarter in both arms, and during the peak the measured HVAC draw reaches
-exactly zero for several consecutive steps — the building coasts on heat
-banked while power was cheap. Comfort violations are eliminated in both
-arms. Total energy rises slightly, which is expected: this shifts *when*
-energy is bought, not how much.
+Reproduce with:
 
-**But the LLM makes the result worse, not better.** On the metrics that
-matter it is beaten by its own rule set: −1.2 % cost against −4.2 %, and
-carbon actually 1.5 % *worse than baseline*. The override rate tells the
-story — 60.4 %, up from 12.5 % before grid-awareness was added. Going
-from a 3-rule to a 5-rule prompt pushed `qwen2.5-coder:1.5b` past its
-capability, so the supervisor now corrects most of its decisions, and the
-ones that survive are worse than what the rules would have chosen.
+```bash
+python src/log_tools.py out/big_log2/eplusout.err 15
+```
 
-The headline savings in this project therefore belong to the
-deterministic control logic, not to the language model. Attributing them
-to the LLM would be false.
-
-### Why not a larger headline energy number
-
-With **flat** pricing, the supervisor rules landed within ±1 % of the
-fixed baseline across every climate tested (outdoor base 14 / 8 / 2 /
-−4 °C). A well-chosen setback schedule already captures nearly all
-available savings in a single-zone building with static occupancy. Real
-headroom appears only once something varies that a static schedule cannot
-track — here, price and carbon intensity. Reporting a large "energy
-saving" against this baseline would have required either a weaker
-baseline or a broken energy model.
+The project's own model is well-conditioned and produces a clean 16-line `.err`,
+which would demonstrate nothing — hence testing the pipeline against a large,
+genuinely warning-heavy model.
 
 ---
 
-## 8. Verification and known defects found
+## 5. Robustness over an extended horizon
 
-Bugs found in this codebase during development, all fixed and recorded in
-`BUILD_LOG.md` with reproduction detail:
+The three-week experiment is the reported result, but it does not by itself show
+that the loop survives a long run. `src/endurance_run.py` runs the identical
+pipeline over a full cooling season and records whether anything degrades.
 
-- **Exploitable energy model.** Energy was charged as
-  `abs(setpoint − zone_temp)`, making it nearly free to hold
-  `setpoint == zone_temp`. The LLM found the exploit and began echoing
-  the current zone temperature back as its setpoint. Replaced with a
-  degree-day model including standing envelope loss.
-- **Controller droop.** A plain proportional term meant a 21 °C setpoint
-  settled at 19.2 °C, so the baseline's nominal comfort was fictitious.
-  Now converges to setpoint (measured droop 0.00 °C).
-- **Stale occupancy at period boundaries.** `occupied` was read from a
-  flag refreshed only inside `step()`, so at exactly 08:00 the horizon
-  reported 1440 minutes instead of 0 and ordered a setback as occupants
-  arrived.
-- **Stacked drift rules.** Optimal-stop and peak-discharge both fired at
-  once, compounding their temperature drops through the comfort floor.
-  Both are now gated on `projected_temp_after()`, validated against
-  logged data (predicted 20.23 °C where the simulation produced
-  20.223 °C).
-- **Encoding.** Log files written in the Windows default codepage became
-  unreadable when reasoning text contained `°`.
+| | 3-week experiment | **Endurance run** |
+|---|---|---|
+| Period | 1–21 July | **1 June – 31 August** |
+| Timesteps | 2,016 | **8,832** |
+| Supervisory decisions | 126 | **552** |
+| Crashes / hangs | 0 | **0** |
+| Clamp violations | 0 | **0** |
+| Comfort violations | 0.00 % | **0.00 %** |
+| Malformed JSON | 0 | **0** |
+| Fallbacks | 1 (0.8 %) | **5 (0.9 %)** |
+| Cache hit rate | 31.7 % | **59.8 %** |
+| Savings | +3.32 % | +2.72 % |
 
-Supervisor logic has a 10-case test covering each override branch plus
-the cases that must *not* override.
+**The failure rate does not grow with horizon length** — fallbacks stay under
+1 % of decisions, and the three "must never happen" counters (clamp violations,
+comfort breaches, malformed JSON) stay at zero across 4.4× the timesteps.
+
+**The cache gets better with scale.** Hit rate nearly doubles over the longer
+run, because more (hour-block, occupancy, outdoor, indoor) states repeat. The
+marginal cost of each additional simulated day *falls* as the run lengthens —
+the opposite of the usual scaling worry with an LLM in the loop.
+
+What makes the loop survive:
+
+- **Handles asserted at resolution**, failing loudly and naming the missing one
+  rather than silently reading zeros
+- **Callback bodies wrapped** — a controller fault degrades one decision instead
+  of killing the simulation
+- **Warmup and sizing periods filtered** by an explicit run-period guard, so
+  design days never contaminate results
+- **Bounded retry** around the Windows `WinError 5` sharing violation, treating
+  published state as telemetry: a dropped write is preferable to a dead run
+- **Guaranteed fallback** — two failed LLM attempts hand the interval to the
+  rule-based controller
+
+Savings are lower over the season (2.72 % vs 3.32 %) for an honest reason: June
+and August are milder than the July peak week, so there is less cooling load to
+save on.
 
 ---
 
-## 9. Limitations and next steps
+## Repository map
 
-- **EnergyPlus integration is scaffolded, not complete.** `run_loop.py`
-  has the PyEnergyPlus callback structure with explicit `TODO`s for zone
-  and actuator handles; EnergyPlus is not installed on the development
-  machine. All results above come from the lightweight thermal model,
-  which is a proxy — its parameters are plausible but not calibrated
-  against a real building.
-- **The LLM's contribution is currently negative.** The `mock-rules`
-  control arm beats the LLM arm on both cost and carbon (§7). Model
-  capability is the binding constraint: at 3 rules the override rate was
-  12.5 %, at 5 rules it is 60.4 %. Running `qwen2.5-coder:7b` on adequate
-  hardware is the single highest-value change and needs only a `--model`
-  flag. Until then, the honest claim is that this project demonstrates a
-  working closed-loop *architecture* with a model too small to drive it.
-- **Single zone, static occupancy schedule.** Multi-zone control with
-  stochastic occupancy is where LLM reasoning would plausibly beat a rule
-  table, because the rule table stops being writable by hand.
-- **Price and carbon curves are representative, not measured** — stated
-  shapes for a grid with solar and gas peaking plant, not utility data.
+| Path | Purpose |
+|---|---|
+| `src/config.py` | Single source of truth: zones, schedules, limits, run period |
+| `src/prepare_model.py` | Trims the stock example to a run week and instruments it |
+| `src/eplus_runner.py` | In-process EnergyPlus runner; sensing and actuation callbacks |
+| `src/policy.py` | `Policy`, `clamp_pair`, `operating_envelope` — the safety layer |
+| `src/controllers.py` | Deterministic controllers (baseline, fixed, rule-based) |
+| `src/mcp_server.py` | FastMCP stdio server exposing the five tools |
+| `src/mcp_bridge.py` | Sync facade over the async MCP session |
+| `src/agent.py` | LLM supervisor: prompt, schema, self-correction, cache |
+| `src/log_tools.py` | `.err` filter / dedupe / truncate pipeline |
+| `src/metrics.py` | Metrics computed from `eplusout.csv` |
+| `src/run_experiment.py` | Runs the three modes and writes comparable results |
+| `src/export_idf.py` | Bakes the agent's policy into `agent_optimized.idf` |
+| `src/compare_models.py` | Side experiment: same loop, different LLM |
+| `src/test_clamp.py` | Safety-clamp unit tests |
+| `src/test_actuation.py` | Proves actuation moves energy in both directions |
+| `src/test_mcp_client.py` | Standalone MCP client; exercises tools mid-simulation |
+| `dashboard/build_report.py` | Builds the self-contained HTML report |

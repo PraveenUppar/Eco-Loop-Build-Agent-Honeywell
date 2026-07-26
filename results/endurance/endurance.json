@@ -1,0 +1,76 @@
+{
+  "baseline": {
+    "mode": "baseline",
+    "exit_code": 0,
+    "completed": true,
+    "timesteps_logged": 8832,
+    "clamp_violations": 0,
+    "envelope_engaged_steps": 0,
+    "wall_clock_s": 34.4,
+    "metrics": {
+      "label": "baseline",
+      "timesteps": 8832,
+      "total_kwh": 12570.4,
+      "cooling_kwh": 2754.63,
+      "fans_kwh": 415.42,
+      "hvac_kwh": 3170.04,
+      "peak_kw": 20.208,
+      "mean_outdoor_c": 22.35,
+      "occupied_zone_observations": 14520,
+      "comfort_violation_pct": 0.0,
+      "mean_occupied_zone_c": 23.77,
+      "max_occupied_zone_c": 24.03,
+      "min_occupied_zone_c": 22.2
+    }
+  },
+  "agent": {
+    "mode": "agent",
+    "exit_code": 0,
+    "completed": true,
+    "timesteps_logged": 8832,
+    "clamp_violations": 0,
+    "envelope_engaged_steps": 397,
+    "wall_clock_s": 770.0,
+    "agent": {
+      "model": "qwen2.5:3b-instruct",
+      "supervisory_decisions": 552,
+      "llm_calls": 261,
+      "cache_hits": 330,
+      "cache_hit_rate_pct": 59.8,
+      "retries": 39,
+      "invalid_json": 0,
+      "tool_rejections": 44,
+      "fallbacks": 5,
+      "median_latency_s": 2.7,
+      "total_llm_seconds": 733.9
+    },
+    "metrics": {
+      "label": "agent",
+      "timesteps": 8832,
+      "total_kwh": 12228.61,
+      "cooling_kwh": 2438.02,
+      "fans_kwh": 380.94,
+      "hvac_kwh": 2818.95,
+      "peak_kw": 20.259,
+      "mean_outdoor_c": 22.35,
+      "occupied_zone_observations": 14520,
+      "comfort_violation_pct": 0.0,
+      "mean_occupied_zone_c": 24.29,
+      "max_occupied_zone_c": 25.0,
+      "min_occupied_zone_c": 20.18
+    }
+  },
+  "comparison": {
+    "baseline_kwh": 12570.4,
+    "agent_kwh": 12228.61,
+    "savings_pct": 2.72,
+    "hvac_savings_pct": 11.08,
+    "baseline_comfort_violation_pct": 0.0,
+    "agent_comfort_violation_pct": 0.0
+  },
+  "verdict": {
+    "ran_to_completion": true,
+    "total_clamp_violations": 0,
+    "timesteps": 8832
+  }
+}
