@@ -5,6 +5,7 @@ sensors and writes thermostat setpoints **while the simulation is running**,
 through an MCP tool layer, and cuts electricity use without pushing occupants
 outside their comfort band.
 
+#### DEMO VIDEO LINK: https://drive.google.com/file/d/1Q8WI6i1nENoEJu2VijL1u5ENTFI4CLQj/view?usp=sharing
 ---
 
 ## Results
