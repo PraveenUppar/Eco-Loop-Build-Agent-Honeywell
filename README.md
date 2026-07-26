@@ -6,6 +6,7 @@ through an MCP tool layer, and cuts electricity use without pushing occupants
 outside their comfort band.
 
 #### DEMO VIDEO LINK: https://drive.google.com/file/d/1Q8WI6i1nENoEJu2VijL1u5ENTFI4CLQj/view?usp=sharing
+
 ---
 
 ## Results
@@ -48,9 +49,7 @@ section below.
 
 **Prerequisites**
 
-1. **EnergyPlus 26.1** — <https://energyplus.net/downloads>. The default Windows
-   path `C:\EnergyPlusV26-1-0` is assumed; change `ENERGYPLUS_DIR` in
-   [src/config.py](src/config.py) if yours differs. `pyenergyplus` ships with it.
+1. **EnergyPlus 26.1**
 2. **Ollama** — <https://ollama.com>, then pull the model:
 
 ```bash
