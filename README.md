@@ -9,22 +9,6 @@ outside their comfort band.
 
 ---
 
-## Results
-
-Three summer weeks (1–21 July), Chicago TMY3, 5-zone VAV office. **Identical
-building, weather and run period — the only variable is the controller.**
-
-| Controller                       | kWh         | Saved      | HVAC kWh   | HVAC saved  | Peak kW   | Comfort violations |
-| -------------------------------- | ----------- | ---------- | ---------- | ----------- | --------- | ------------------ |
-| Baseline (stock schedules)       | 3059.74     | —          | 904.23     | —           | 20.22     | 0.00%              |
-| Rule-based (no LLM)              | 2990.15     | +2.27%     | 832.82     | +7.90%      | 19.65     | 0.00%              |
-| **LLM agent (supervisory)**      | **2958.16** | **+3.32%** | **800.20** | **+11.50%** | **19.46** | **0.00%**          |
-| `agent_optimized.idf` (exported) | 2943.65     | +3.79%     | —          | —           | —         | 0.00%              |
-
-**3.32 % of facility electricity, 11.5 % of HVAC electricity, zero comfort
-violations** — and the agent beats the rule-based controller by 1.05 percentage
-points while also cutting peak demand 3.7 %.
-
 ## The idea in one picture
 
 ```mermaid
@@ -44,6 +28,24 @@ every 15-minute timestep. Full reasoning in the [Architecture](#architecture)
 section below.
 
 ---
+
+
+## Results
+
+Three summer weeks (1–21 July), Chicago TMY3, 5-zone VAV office. **Identical
+building, weather and run period — the only variable is the controller.**
+
+| Controller                       | kWh         | Saved      | HVAC kWh   | HVAC saved  | Peak kW   | Comfort violations |
+| -------------------------------- | ----------- | ---------- | ---------- | ----------- | --------- | ------------------ |
+| Baseline (stock schedules)       | 3059.74     | —          | 904.23     | —           | 20.22     | 0.00%              |
+| Rule-based (no LLM)              | 2990.15     | +2.27%     | 832.82     | +7.90%      | 19.65     | 0.00%              |
+| **LLM agent (supervisory)**      | **2958.16** | **+3.32%** | **800.20** | **+11.50%** | **19.46** | **0.00%**          |
+| `agent_optimized.idf` (exported) | 2943.65     | +3.79%     | —          | —           | —         | 0.00%              |
+
+**3.32 % of facility electricity, 11.5 % of HVAC electricity, zero comfort
+violations** — and the agent beats the rule-based controller by 1.05 percentage
+points while also cutting peak demand 3.7 %.
+
 
 ## Setup
 
