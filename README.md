@@ -5,9 +5,6 @@ sensors and writes thermostat setpoints **while the simulation is running**,
 through an MCP tool layer, and cuts electricity use without pushing occupants
 outside their comfort band.
 
-Everything runs on one machine. The model is `qwen2.5:3b-instruct` on Ollama —
-deliberately small, which is why the validation layer around it does real work.
-
 ---
 
 ## Results
@@ -26,15 +23,6 @@ building, weather and run period — the only variable is the controller.**
 violations** — and the agent beats the rule-based controller by 1.05 percentage
 points while also cutting peak demand 3.7 %.
 
-Two caveats stated up front:
-
-- **HVAC is the fairer number.** Lights and plug loads are ~70 % of facility
-  electricity and thermostats cannot touch them. The 11.5 % figure is what the
-  controller actually influences.
-- **The exported IDF beats the live agent** (3.79 % vs 3.32 %) because taking
-  the median per (day type, hour) discards the 3B model's occasional outlier
-  decisions. That gap _is_ the model's inconsistency, quantified.
-
 ### Agent telemetry
 
 |                                  |                                                  |
@@ -49,9 +37,6 @@ Two caveats stated up front:
 | Median latency                   | 3.27 s                                           |
 | Safety-clamp violations          | **0**                                            |
 | Wall clock                       | 360 s total, of which the simulation is **12 s** |
-
-The loop is sound — zero malformed JSON, one fallback in 126 decisions. What
-limits savings is model _judgment_, not plumbing.
 
 ---
 
@@ -206,19 +191,6 @@ thread and calls all five tools **while it is still running**.
 | `models/agent_optimized.idf` | **The agent's learned policy, baked into a standalone model**   |
 | `results/`                   | Metrics and timeseries per mode                                 |
 
-### `agent_optimized.idf`
-
-Actuating the EnergyPlus API leaves no file behind — the setpoints exist only in
-memory. `src/export_idf.py` reconstructs what the agent actually applied into
-real `Schedule:Compact` objects and writes a model that runs **with no LLM, no
-MCP server and no Python in the loop**.
-
-The median is taken per (day type, hour) bucket, which discards the occasional
-outlier decision from a 3B model. The exported model therefore performs slightly
-_better_ than the live agent run.
-
----
-
 ## The building
 
 `5ZoneAirCooled` from the EnergyPlus example files: five conditioned zones plus
@@ -315,14 +287,6 @@ LLM output -> JSON schema -> clamp_pair() -> tool-layer occupancy check
 | `set_setpoints`      | Context-aware. **Occupied:** rejects cooling above 25 °C. **Empty:** rejects cooling below 26 °C — running plant for nobody. Rejections carry the reason, which drives self-correction.        |
 | `operating_envelope` | Runs in the inner loop _every timestep_, independent of what the supervisor asked for 4 hours ago. Pulls setpoints into the comfort band when occupied; pushes them out to setback when empty. |
 
-The middle layer matters because the supervisor decides every four hours: a
-setback chosen at 04:00 would otherwise still be in force at 06:00 when people
-arrive.
-
-`test_clamp.py` exercises this against deliberately hostile input — out-of-range
-values, strings, `None`, `NaN`/`inf`, booleans, inverted setpoints, unknown zone
-names and four malformed LLM payloads. Every case lands inside the envelope.
-
 ### 2. Prompt engineering strategy
 
 #### Teach the domain, do not dictate the answer
@@ -366,17 +330,9 @@ pipeline over a full cooling season and records whether anything degrades.
 | Cache hit rate        | 31.7 %            | **59.8 %**             |
 | Savings               | +3.32 %           | +2.72 %                |
 
-**The failure rate does not grow with horizon length** — fallbacks stay under
-1 % of decisions, and the three "must never happen" counters (clamp violations,
-comfort breaches, malformed JSON) stay at zero across 4.4× the timesteps.
-
 **The cache gets better with scale.** Hit rate nearly doubles over the longer
 run, because more (hour-block, occupancy, outdoor, indoor) states repeat. The
 marginal cost of each additional simulated day _falls_ as the run lengthens —
 the opposite of the usual scaling worry with an LLM in the loop.
-
-Savings are lower over the season (2.72 % vs 3.32 %) for an honest reason: June
-and August are milder than the July peak week, so there is less cooling load to
-save on.
 
 ---
