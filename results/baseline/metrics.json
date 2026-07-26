@@ -12,7 +12,7 @@
   "mean_occupied_zone_c": 23.79,
   "max_occupied_zone_c": 24.08,
   "min_occupied_zone_c": 22.2,
-  "wall_clock_s": 7.7,
+  "wall_clock_s": 11.5,
   "clamp_violations": 0,
   "envelope_engaged_steps": 0
 }

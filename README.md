@@ -23,23 +23,6 @@ building, weather and run period — the only variable is the controller.**
 violations** — and the agent beats the rule-based controller by 1.05 percentage
 points while also cutting peak demand 3.7 %.
 
-### Agent telemetry
-
-|                                  |                                                  |
-| -------------------------------- | ------------------------------------------------ |
-| Model                            | `qwen2.5:3b-instruct` (local, Ollama)            |
-| Supervisory decisions            | 126 (one per 4 simulated hours)                  |
-| Model invocations                | 102 (retries included)                           |
-| Served from cache                | 40 — **31.7 %** hit rate                         |
-| Malformed JSON                   | **0**                                            |
-| Tool rejections → self-corrected | 17 → 16 retries                                  |
-| Fell back to rule-based          | **1** of 126                                     |
-| Median latency                   | 3.27 s                                           |
-| Safety-clamp violations          | **0**                                            |
-| Wall clock                       | 360 s total, of which the simulation is **12 s** |
-
----
-
 ## The idea in one picture
 
 ```mermaid
