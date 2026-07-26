@@ -18,7 +18,7 @@
   "hvac_savings_pct": 7.9,
   "peak_reduction_pct": 2.79,
   "comfort_delta_pct": 0.0,
-  "wall_clock_s": 5.3,
+  "wall_clock_s": 7.4,
   "clamp_violations": 0,
   "envelope_engaged_steps": 31
 }

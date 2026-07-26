@@ -1,4 +1,4 @@
-# Eco-Loop — closed-loop building control with a local LLM
+# Eco-Loop: closed-loop building control with a local LLM
 
 A local language model supervises a live EnergyPlus simulation. It reads
 sensors and writes thermostat setpoints **while the simulation is running**,

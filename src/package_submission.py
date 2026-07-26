@@ -20,16 +20,21 @@ import config as cfg
 ARCHIVE = cfg.ROOT / "submission" / "eco_loop_submission.zip"
 
 # Directories copied wholesale, minus the exclusions below.
-TREES = ["src", "docs", "models", "dashboard"]
+TREES = ["src", "models", "dashboard"]
 
 EXCLUDE_DIRS = {"__pycache__", ".venv", "out", "results_2week",
                 "results_3week", "submission", ".git"}
-EXCLUDE_SUFFIX = {".pyc", ".pyo"}
 
-# Individual files at the repo root. (presentation.md lives in docs/, which is
-# already copied wholesale via TREES.)
-FILES = ["README.md", "SUBMISSION.md", "ARCHITECTURE.md",
-         "requirements.txt", ".gitignore"]
+# The submission portal scans inside the archive and rejects executable script
+# formats ("UnAcceptable file format: Python script"). Source code is delivered
+# through the GitHub repository URL instead -- deliverable 1 asks for the repo,
+# not for code in the upload -- so no .py ships here. The deliverable checks
+# below still verify every source file exists on disk.
+EXCLUDE_SUFFIX = {".pyc", ".pyo", ".py"}
+
+# Individual files at the repo root. The architecture document is a section of
+# README.md rather than a separate file, so there is nothing extra to add here.
+FILES = ["README.md", "SUBMISSION.md", "requirements.txt", ".gitignore"]
 
 # Results: keep the analysis outputs, drop the bulky raw EnergyPlus dumps.
 RESULT_GLOBS = [
@@ -50,9 +55,11 @@ DELIVERABLES = {
     "2. Building models": ["models/baseline.idf", "models/simulation.idf",
                            "models/agent_optimized.idf"],
     "3. Savings dashboard": ["dashboard/report.html", "results/summary.json"],
-    "4. Architecture document": ["ARCHITECTURE.md"],
-    "5. Demo video script": ["docs/DEMO_SCRIPT.md"],
-    "Presentation content": ["docs/presentation.md"],
+    # The four required architecture sections are headings inside README.md;
+    # there is no separate ARCHITECTURE.md any more.
+    "4. Architecture document": ["README.md"],
+    # The demo video and the presentation are both built outside the repo and
+    # submitted alongside this archive, so neither has a source file to verify.
     "Submission map": ["SUBMISSION.md"],
 }
 
@@ -109,10 +116,15 @@ def main() -> None:
     size_mb = ARCHIVE.stat().st_size / 1024 / 1024
     print(f"\nwrote {ARCHIVE}")
     print(f"  {len(files)} files, {size_mb:.1f} MB")
+    print("\nSource code is NOT in this archive by design -- the portal rejects")
+    print(".py files. Deliverable 1 is satisfied by the GitHub repository URL.")
     print("\nStill to add by hand:")
-    print("  - demo video (record from docs/DEMO_SCRIPT.md, max 3:00)")
-    print("  - presentation PDF (fill the template from presentation.md, export PDF)")
+    print("  - GitHub repository URL (deliverable 1: source code)")
+    print("  - demo video (max 3:00)")
+    print("  - presentation PDF (export the 6-slide deck to PDF)")
     print("  - dashboard PDF (open dashboard/report.html, Ctrl+P, Save as PDF)")
+    print("\nIf the portal still rejects this zip, follow its own fallback:")
+    print("print README.md and dashboard/report.html to PDF and upload those.")
 
 
 if __name__ == "__main__":

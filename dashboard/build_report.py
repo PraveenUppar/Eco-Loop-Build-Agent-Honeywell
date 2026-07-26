@@ -40,12 +40,6 @@ SHORT = {"baseline": "Baseline", "rulebased": "Rule-based", "agent": "LLM agent"
 # results table repeats the same numbers in text.
 LIGHT = {"baseline": "#2a78d6", "rulebased": "#eb6834", "agent": "#1baf7a"}
 
-# A second, independent identity pair for charts whose grouping isn't
-# "controller mode" (occupied/empty). Reuse across unrelated charts is fine --
-# each chart carries its own legend and labels, so identity never depends on a
-# hue meaning the same thing everywhere on the page.
-OCCUPANCY_COLOR = {"Occupied": "#2a78d6", "Empty": "#e34948"}
-
 INK = {"light": {"grid": "#e1e0d9", "axis": "#c3c2b7", "muted": "#898781"}}
 GOOD = "#0ca30c"
 OTHER_GRAY = "#898781"
@@ -69,7 +63,7 @@ def parse_stamp(raw: str) -> datetime:
             + timedelta(hours=hh, minutes=mm, seconds=ss))
 
 
-def load() -> tuple[dict[str, pd.DataFrame], dict[str, Any], list[dict]]:
+def load() -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     frames: dict[str, pd.DataFrame] = {}
     for mode in MODES:
         path = cfg.RESULTS / mode / "timeseries.csv"
@@ -83,13 +77,7 @@ def load() -> tuple[dict[str, pd.DataFrame], dict[str, Any], list[dict]]:
     summary = json.loads(summary_path.read_text(encoding="utf-8")) \
         if summary_path.exists() else {}
 
-    calls: list[dict] = []
-    calls_path = cfg.RESULTS / "agent" / "llm_calls.jsonl"
-    if calls_path.exists():
-        with open(calls_path, encoding="utf-8") as fh:
-            for line in fh:
-                calls.append(json.loads(line))
-    return frames, summary, calls
+    return frames, summary
 
 
 def load_endurance() -> tuple[dict[str, Any] | None, dict[str, pd.DataFrame]]:
@@ -111,115 +99,6 @@ def load_endurance() -> tuple[dict[str, Any] | None, dict[str, pd.DataFrame]]:
             df["ts"] = df["datetime_raw"].map(parse_stamp)
             frames[mode] = df
     return meta, frames
-
-
-def load_decision_points() -> list[dict[str, Any]]:
-    """Every applied decision, joined with the sensor reading that prompted it.
-
-    Used for the response-curve scatter: what outdoor temperature was it, and
-    what cooling setpoint did the agent choose. Built from logged data, not
-    hand-written -- the same join `sample_cycle` does for one cycle, here for
-    all of them.
-    """
-    calls_path = cfg.RESULTS / "agent" / "llm_calls.jsonl"
-    rows_path = cfg.RESULTS / "agent" / "run_log.jsonl"
-    if not (calls_path.exists() and rows_path.exists()):
-        return []
-
-    rows_by_step = {}
-    with open(rows_path, encoding="utf-8") as fh:
-        for line in fh:
-            r = json.loads(line)
-            rows_by_step[r["step"]] = r
-
-    points = []
-    with open(calls_path, encoding="utf-8") as fh:
-        for line in fh:
-            call = json.loads(line)
-            applied = call.get("applied") or {}
-            cooling = applied.get("cooling_c")
-            row = rows_by_step.get(call.get("step"))
-            if cooling is None or row is None:
-                continue
-            points.append({
-                "outdoor": row["outdoor_temp"],
-                "cooling": cooling,
-                "occupied": row["occupancy"] > 0.05,
-            })
-    return points
-
-
-def sample_cycle() -> list[tuple[str, str]] | None:
-    """Reconstruct one real control cycle from the logs.
-
-    Prefers a decision that needed a retry, so the dashboard shows the tool
-    layer rejecting a policy and the model correcting itself, rather than only
-    the happy path. Built from logged data, not hand-written.
-    """
-    calls_path = cfg.RESULTS / "agent" / "llm_calls.jsonl"
-    rows_path = cfg.RESULTS / "agent" / "run_log.jsonl"
-    if not (calls_path.exists() and rows_path.exists()):
-        return None
-
-    calls = [json.loads(l) for l in open(calls_path, encoding="utf-8")]
-    # Prefer a cycle that was rejected AND recovered: it shows the whole loop
-    # including self-correction. A decision that ended in a fallback has no
-    # model response to display and would misrepresent the outcome.
-    chosen = (next((c for c in calls
-                    if c.get("retries") and c.get("valid")
-                    and c.get("response")), None)
-              or next((c for c in calls
-                       if c.get("valid") and c.get("response")), None))
-    if not chosen:
-        return None
-
-    row = None
-    with open(rows_path, encoding="utf-8") as fh:
-        for line in fh:
-            r = json.loads(line)
-            if r["step"] == chosen.get("step"):
-                row = r
-                break
-    if not row:
-        return None
-
-    temps = "  ".join(f"{z.split('-')[0]} {v:.1f}"
-                      for z, v in row["zone_temps"].items())
-    applied = chosen.get("applied") or {}
-    response = chosen.get("response") or {}
-    retries = chosen.get("retries", 0)
-
-    lines = [
-        ("SENSE", f"EnergyPlus &rarr; agent   sim time {row['sim_time']}"),
-        ("", f"{temps} &deg;C"),
-        ("", f"outdoor {row['outdoor_temp']:.1f} &deg;C | "
-             f"{'OCCUPIED' if row['occupancy'] > 0.05 else 'EMPTY'} | "
-             f"{row['cumulative_kwh']:.1f} kWh used so far"),
-        ("TOOL", "MCP get_energy_summary &rarr; trailing 4 h energy and peak"),
-    ]
-    reply = json.dumps({k: response[k] for k in ("heating_c", "cooling_c")
-                        if k in response})
-    if retries:
-        lines.append(("LLM", "first reply proposed setpoints outside the "
-                             "envelope for the current occupancy"))
-        lines.append(("VALID", "<b>REJECTED</b> by the tool layer, with the "
-                               "specific reason returned to the model"))
-        lines.append(("LLM", f"corrected reply after {retries} "
-                             f"self-correction{'s' if retries > 1 else ''} "
-                             f"&rarr; {reply}"))
-    else:
-        lines.append(("LLM", f"qwen2.5:3b-instruct &rarr; {reply}"))
-    if response.get("reason"):
-        lines.append(("", f"model's reason: &ldquo;"
-                          f"{str(response['reason'])[:88]}&rdquo;"))
-
-    lines += [
-        ("VALID", f"accepted &rarr; heating {applied.get('heating_c')} &deg;C / "
-                  f"cooling {applied.get('cooling_c')} &deg;C"),
-        ("ACT", "agent &rarr; EnergyPlus: setpoint schedules overwritten, "
-                "applied every 15 min until the next decision"),
-    ]
-    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -306,28 +185,6 @@ def fig_daily(frames: dict[str, pd.DataFrame]) -> go.Figure:
     return fig
 
 
-def fig_peak(summary: dict[str, Any]) -> go.Figure:
-    """Peak demand by controller -- a single labelled series, no legend needed."""
-    modes_present = [m for m in MODES if m in summary]
-    fig = go.Figure()
-    if modes_present:
-        xs = [SHORT[m] for m in modes_present]
-        ys = [summary[m]["peak_kw"] for m in modes_present]
-        fig.add_trace(go.Bar(
-            x=xs, y=ys, width=0.42,
-            marker=dict(color=[LIGHT[m] for m in modes_present]),
-            text=[f"{v:.1f}" for v in ys], textposition="outside",
-            textfont=dict(color=INK["light"]["muted"]),
-            hovertemplate="%{y:.2f} kW<extra></extra>",
-        ))
-    layout = base_layout(320)
-    layout["margin"] = dict(l=56, r=32, t=32, b=44)
-    layout["bargap"] = 0.55
-    fig.update_layout(**layout)
-    fig.update_yaxes(title_text="Peak demand (kW)")
-    return fig
-
-
 def fig_comfort(frames: dict[str, pd.DataFrame]) -> go.Figure:
     """Zone temperature against the comfort band, occupied hours shaded."""
     fig = go.Figure()
@@ -357,53 +214,6 @@ def fig_comfort(frames: dict[str, pd.DataFrame]) -> go.Figure:
     return fig
 
 
-def fig_setpoints(frames: dict[str, pd.DataFrame],
-                  calls: list[dict]) -> go.Figure:
-    """The money chart: the agent's setpoints, with each LLM decision marked."""
-    fig = go.Figure()
-    if "agent" not in frames:
-        return fig
-    df = frames["agent"]
-
-    fig.add_trace(go.Scatter(
-        x=df["ts"], y=df["cooling_sp"], name="Cooling setpoint",
-        mode="lines", line=dict(color=LIGHT["agent"], width=2, shape="hv"),
-        hovertemplate="cooling %{y:.1f} °C<extra></extra>",
-    ))
-    fig.add_trace(go.Scatter(
-        x=df["ts"], y=df["heating_sp"], name="Heating setpoint",
-        mode="lines", line=dict(color=LIGHT["rulebased"], width=2, shape="hv"),
-        hovertemplate="heating %{y:.1f} °C<extra></extra>",
-    ))
-
-    xs, ys, texts = [], [], []
-    for call in calls:
-        applied = call.get("applied") or {}
-        if applied.get("cooling_c") is None:
-            continue
-        month, day = (int(v) for v in call["sim_time"].split()[0].split("-"))
-        hh, mm = (int(v) for v in call["sim_time"].split()[1].split(":"))
-        xs.append(datetime(SIM_YEAR, month, day) + timedelta(hours=hh, minutes=mm))
-        ys.append(applied["cooling_c"])
-        reason = (call.get("response") or {}).get("reason", "") or call.get("note", "")
-        kind = "cached" if call.get("cache_hit") else (
-            "fallback" if not call.get("valid", True) else "LLM")
-        texts.append(f"{kind} · retries {call.get('retries', 0)}<br>{reason[:70]}")
-
-    fig.add_trace(go.Scatter(
-        x=xs, y=ys, mode="markers", name="LLM decision",
-        marker=dict(color=LIGHT["baseline"], size=9,
-                    line=dict(color="#fcfcfb", width=2)),
-        text=texts, hovertemplate="%{text}<extra>decision</extra>",
-    ))
-
-    layout = legend_layout(360)
-    layout["hovermode"] = "closest"
-    fig.update_layout(**layout)
-    fig.update_yaxes(title_text="Setpoint (°C)")
-    return fig
-
-
 def fig_savings_area(frames: dict[str, pd.DataFrame]) -> go.Figure:
     """Cumulative electricity saved vs. baseline, as a filled area over time."""
     fig = go.Figure()
@@ -428,38 +238,6 @@ def fig_savings_area(frames: dict[str, pd.DataFrame]) -> go.Figure:
     layout = legend_layout(360)
     fig.update_layout(**layout)
     fig.update_yaxes(title_text="Cumulative electricity saved vs. baseline (kWh)")
-    return fig
-
-
-def fig_response_scatter(points: list[dict[str, Any]]) -> go.Figure:
-    """Every applied cooling setpoint against the outdoor temperature at the
-    time, split by occupancy -- the closest thing to a picture of the model's
-    learned policy rather than a single run's trajectory."""
-    fig = go.Figure()
-    if not points:
-        return fig
-
-    groups: dict[str, list[dict[str, Any]]] = {"Occupied": [], "Empty": []}
-    for p in points:
-        groups["Occupied" if p["occupied"] else "Empty"].append(p)
-
-    for name, pts in groups.items():
-        if not pts:
-            continue
-        fig.add_trace(go.Scatter(
-            x=[p["outdoor"] for p in pts], y=[p["cooling"] for p in pts],
-            mode="markers", name=name,
-            marker=dict(color=OCCUPANCY_COLOR[name], size=9, opacity=0.75,
-                        line=dict(color="#fcfcfb", width=2)),
-            hovertemplate="outdoor %{x:.1f} °C &rarr; cooling %{y:.1f} °C"
-                          "<extra>" + name + "</extra>",
-        ))
-
-    layout = legend_layout(360)
-    layout["hovermode"] = "closest"
-    fig.update_layout(**layout)
-    fig.update_xaxes(title_text="Outdoor temperature (°C)")
-    fig.update_yaxes(title_text="Chosen cooling setpoint (°C)")
     return fig
 
 
@@ -516,24 +294,6 @@ def fig_endurance(frames: dict[str, pd.DataFrame]) -> go.Figure:
     layout = legend_layout(340)
     fig.update_layout(**layout)
     fig.update_yaxes(title_text="Cumulative electricity (kWh)")
-    return fig
-
-
-def fig_latency(calls: list[dict]) -> go.Figure:
-    values = [c["latency_s"] for c in calls
-              if c.get("latency_s") and not c.get("cache_hit")]
-    fig = go.Figure()
-    if values:
-        fig.add_trace(go.Histogram(
-            x=values, nbinsx=24,
-            marker=dict(color=LIGHT["baseline"]),
-            hovertemplate="%{y} calls at %{x:.1f}s<extra></extra>",
-        ))
-    layout = base_layout(300)
-    layout["margin"] = dict(l=56, r=32, t=24, b=44)
-    fig.update_layout(**layout)
-    fig.update_xaxes(title_text="LLM response latency (s)")
-    fig.update_yaxes(title_text="Decisions")
     return fig
 
 
@@ -643,14 +403,6 @@ def endurance_table(meta: dict[str, Any], summary: dict[str, Any]) -> str:
             f"{body}</table>")
 
 
-def trace_block(lines: list[tuple[str, str]]) -> str:
-    out = []
-    for tag, text in lines:
-        label = f"<span class='tag'>{tag}</span>" if tag else "<span class='tag'></span>"
-        out.append(f"<div class='traceline'>{label}<span>{text}</span></div>")
-    return f"<div class='trace'>{''.join(out)}</div>"
-
-
 def figure_block(fig: go.Figure, div_id: str, title: str, note: str,
                  first: bool, wide: bool = False) -> str:
     html = fig.to_html(include_plotlyjs="inline" if first else False,
@@ -679,13 +431,11 @@ def section(anchor: str, kicker: str, title: str, description: str, body: str) -
 
 
 def build() -> Path:
-    frames, summary, calls = load()
+    frames, summary = load()
     if not frames:
         raise SystemExit("no results found -- run src/run_experiment.py first")
 
     endurance_meta, endurance_frames = load_endurance()
-    cycle = sample_cycle()
-    decision_points = load_decision_points()
 
     first_flag = {"done": False}
 
@@ -711,15 +461,10 @@ def build() -> Path:
                         "4.4&times; the reported experiment.")
 
     # -- Comparisons (bar charts) -----------------------------------------
-    comparisons = (
-        block(fig_daily(frames), "chart-daily", "Electricity per day",
-              "Savings concentrate on hot weekdays, when cooling actually "
-              "runs.", wide=True)
-        + block(fig_peak(summary), "chart-peak", "Peak demand by controller",
-                "The single highest instantaneous draw across the run "
-                "&mdash; matters for demand charges, separate from total "
-                "energy.")
-    )
+    comparisons = block(
+        fig_daily(frames), "chart-daily", "Electricity per day",
+        "Savings concentrate on hot weekdays, when cooling actually runs.",
+        wide=True)
 
     # -- Savings over time (area chart) -----------------------------------
     savings = block(fig_savings_area(frames), "chart-savings-area",
@@ -729,44 +474,14 @@ def build() -> Path:
                     "1.05-point contribution of the LLM's situational "
                     "reasoning over a fixed rule.", wide=True)
 
-    # -- Response curve (scatter) ------------------------------------------
-    response = block(fig_response_scatter(decision_points), "chart-response",
-                     "How the agent responds to outdoor temperature",
-                     "Every applied cooling setpoint plotted against the "
-                     "outdoor temperature at that moment. A rising, "
-                     "occupancy-split pattern is the model's learned policy, "
-                     "not a single run's trajectory.", wide=True)
-
-    # -- Breakdown (donut) + distribution (histogram) ----------------------
-    breakdown = (
-        block(fig_hvac_breakdown(summary), "chart-breakdown",
-              "Where the electricity goes",
-              "Cooling and fans are what a thermostat can influence; "
-              "everything else is out of reach &mdash; the honest reason "
-              "the HVAC-only savings figure is reported alongside the "
-              "facility-wide one.", wide=True)
-        + block(fig_latency(calls), "chart-latency", "LLM decision latency",
-                "Local 3B model on commodity hardware. Supervisory cadence "
-                "keeps this off the critical path.")
-    )
-
-    setpoints_section = block(
-        fig_setpoints(frames, calls), "chart-setpoints",
-        "The agent acting on the building",
-        "Setpoints applied every 15 minutes; each dot is a supervisory LLM "
-        "decision. Hover a dot for the model's stated reason and retry "
-        "count.", wide=True)
-
-    cycle_section = ""
-    if cycle:
-        cycle_section = section(
-            "cycle", "How it works", "One control cycle, from the logs",
-            "Reconstructed from <code>llm_calls.jsonl</code> and "
-            "<code>run_log.jsonl</code> &mdash; a real decision, not an "
-            "illustration.",
-            content_card("Sense &rarr; tool call &rarr; model &rarr; "
-                        "validate &rarr; act", "",
-                        trace_block(cycle), wide=True))
+    # -- Breakdown (donut) -------------------------------------------------
+    breakdown = block(
+        fig_hvac_breakdown(summary), "chart-breakdown",
+        "Where the electricity goes",
+        "Cooling and fans are what a thermostat can influence; everything "
+        "else is out of reach &mdash; the honest reason the HVAC-only "
+        "savings figure is reported alongside the facility-wide one.",
+        wide=True)
 
     endurance_section = ""
     if endurance_meta:
@@ -783,9 +498,7 @@ def build() -> Path:
 
     nav_items = [("overview", "Overview"), ("results", "Results"),
                  ("trends", "Trends"), ("comparisons", "Comparisons"),
-                 ("savings-area", "Savings"), ("response", "Response"),
-                 ("breakdown", "Breakdown"), ("agent-behavior", "Agent"),
-                 ("cycle", "How it works")]
+                 ("savings-area", "Savings"), ("breakdown", "Breakdown")]
     if endurance_meta:
         nav_items.append(("endurance-table", "Robustness"))
     nav_html = "".join(f'<a href="#{a}">{t}</a>' for a, t in nav_items)
@@ -888,15 +601,6 @@ table.results tr:last-child td {{ border-bottom:none; }}
 .swatch {{ display:inline-block; width:10px; height:10px; border-radius:3px;
   margin-right:8px; vertical-align:middle; }}
 
-/* trace block ----------------------------------------------------------- */
-.trace {{ font-family:Consolas,"Courier New",monospace; font-size:0.82rem;
-  background:var(--plane); border:1px solid var(--border); border-radius:10px;
-  padding:14px 16px; margin-bottom:8px; overflow-x:auto; }}
-.traceline {{ display:flex; gap:10px; align-items:baseline; padding:3px 0;
-  white-space:nowrap; }}
-.traceline .tag {{ flex:0 0 52px; font-weight:700; font-size:0.72rem;
-  letter-spacing:0.04em; color:var(--s-baseline); }}
-.traceline span:last-child {{ color:var(--text-primary); white-space:normal; }}
 code {{ font-family:Consolas,"Courier New",monospace; font-size:0.85em;
   background:var(--plane); padding:1px 5px; border-radius:4px; }}
 footer {{ color:var(--muted); font-size:0.8rem; margin-top:36px;
@@ -968,19 +672,10 @@ footer {{ color:var(--muted); font-size:0.8rem; margin-top:36px;
          "",
          f'<div class="grid">{savings}</div>')}
 
-{section("response", "Scatter plot", "The agent's learned response",
-         "",
-         f'<div class="grid">{response}</div>')}
-
-{section("breakdown", "Pie / donut &middot; distribution", "Where the electricity goes",
+{section("breakdown", "Pie / donut", "Where the electricity goes",
          "",
          f'<div class="grid">{breakdown}</div>')}
 
-{section("agent-behavior", "Line chart", "The agent acting on the building",
-         "",
-         f'<div class="grid">{setpoints_section}</div>')}
-
-{cycle_section}
 {endurance_section}
 
 <footer>Generated {generated} from results/summary.json ·
